@@ -265,7 +265,11 @@ jobs:
               time.sleep(60)
           PY
           set +e
-          restore-verified run --paths /tmp/demo/m.py --timeout 3 -- python3 /tmp/demo/harness.py
+          # The venv's script and the venv's interpreter, both by absolute path: the
+          # step above proved the wheel produced them, and `restore-verified` on PATH
+          # would be whichever half won the race.
+          /tmp/venv/bin/restore-verified run --paths /tmp/demo/m.py --timeout 3 -- \
+            /tmp/venv/bin/python /tmp/demo/harness.py
           code=$?
           set -e
           echo "exit=$code"
