@@ -200,18 +200,26 @@ jobs:
         # omits a source directory, a broken entry point — is invisible when the tests
         # import from the working directory.
         run: |
+          set -euo pipefail
           python3 -m pip install --quiet build
           python3 -m build --wheel --outdir /tmp/dist
-          python3 -m pip install --quiet /tmp/dist/*.whl
           npm pack --pack-destination /tmp/dist
-          cd /tmp   # away from the source tree, so nothing can resolve from it
 
-          # BOTH HALVES SHIP A BINARY CALLED `restore-verified`, so installing both
-          # globally would leave the PATH deciding which one this step tested. The
-          # wheel's console script is exercised by name; the tarball is unpacked and
-          # its entry point run directly, which also proves `files` in package.json
-          # carries everything the CLI imports.
-          restore-verified --help
+          # A VENV, AND THE SCRIPT CALLED BY ABSOLUTE PATH. Installing into the runner's
+          # interpreter puts the console script wherever that interpreter's scheme says,
+          # which is not always on PATH -- and `command not found` there would read as a
+          # broken entry point when the entry point is fine. The venv makes the location
+          # a fact rather than a guess.
+          python3 -m venv /tmp/venv
+          /tmp/venv/bin/pip install --quiet /tmp/dist/*.whl
+
+          # BOTH HALVES SHIP A BINARY CALLED `restore-verified`, so a global install of
+          # each would leave the PATH deciding which one this step tested. Each is run
+          # from its own artifact instead.
+          cd /tmp   # away from the source tree, so nothing can resolve from it
+          /tmp/venv/bin/restore-verified --help
+          /tmp/venv/bin/python -c "import restore_verified as r; print('wheel imports', r.__version__)"
+
           mkdir -p /tmp/tarball && tar -xzf /tmp/dist/restore-verified-*.tgz -C /tmp/tarball
           node /tmp/tarball/package/js/src/cli.js --help
 
