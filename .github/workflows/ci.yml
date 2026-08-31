@@ -191,10 +191,10 @@ jobs:
     # wheel", skip the install, and produce no console script. The job that exists to
     # prove the built artifact works must not inherit the shortcut that makes the source
     # importable, or it is testing the source tree while believing it is testing a wheel.
+    # Importing the module proves the module imports; it does not prove `pip install`
+    # gives you a working command.
     env:
       PYTHONPATH: ''
- Importing the module proves the
-    # module imports; it does not prove `pip install` gives you a working command.
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
