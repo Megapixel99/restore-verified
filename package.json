@@ -1,6 +1,6 @@
 {
   "name": "restore-verified",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Temporarily modify a file, survive the signal, and prove the tree came back.",
   "keywords": [
     "restore",

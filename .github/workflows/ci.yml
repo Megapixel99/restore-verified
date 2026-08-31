@@ -148,6 +148,45 @@ jobs:
             exit 1
           fi
 
+  versions:
+    # THE VERSION LIVES IN THREE FILES AND THAT IS THREE PLACES TO DRIFT.
+    # `pyproject.toml` is what PyPI publishes, `package.json` is what npm publishes, and
+    # `__version__` is what a user who imports the package reads back. A release where
+    # the first two agree and the third does not is a release that reports the wrong
+    # number to everybody who asks it politely -- and `release.yml` only compared the
+    # first two, because the third is one file further away.
+    #
+    # Checked here as well as at release time on purpose: the release gate is the last
+    # line, and the branch that introduced the disagreement is where it is cheap to fix.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.12'
+      - uses: actions/setup-node@v7
+        with:
+          node-version: '24'
+
+      - name: all three agree
+        run: |
+          set -euo pipefail
+          py=$(python3 -c "import tomllib; print(tomllib.load(open('pyproject.toml','rb'))['project']['version'])")
+          js=$(node -p "require('./package.json').version")
+          # Imported rather than grepped: this is the number a user actually gets back,
+          # and a `__version__` that is right in the file and wrong on import would
+          # satisfy a grep.
+          # PYTHONDONTWRITEBYTECODE so this check never leaves a `.pyc` for the next run
+          # to read. Cache invalidation is keyed on mtime at ONE-SECOND granularity,
+          # and an edit-and-check cycle is milliseconds — the same hazard `canfail`
+          # documents, and it bit this very check while it was being written.
+          dunder=$(PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=python python3 -c "import restore_verified; print(restore_verified.__version__)")
+          echo "pyproject=$py  package.json=$js  __version__=$dunder"
+          if [ "$py" != "$js" ] || [ "$py" != "$dunder" ]; then
+            echo "::error::the three versions disagree"
+            exit 1
+          fi
+
   parity:
     # THE TWO HALVES AGREE ABOUT THE MANIFEST, OR THE MANIFEST IS NOT A CONTRACT.
     # A record written by one half is read by the other in the field; if they disagree

@@ -85,12 +85,24 @@ jobs:
           )
           js_name=$(node -p "require('./package.json').name")
           js_version=$(node -p "require('./package.json').version")
+          # A THIRD PLACE THE VERSION LIVES. `__version__` is what a user who imports
+          # the package reads back, and it is one file further away than the two
+          # manifests -- which is exactly why it is the one that drifts.
+          # PYTHONDONTWRITEBYTECODE so this check never leaves a `.pyc` for the next run
+          # to read. Cache invalidation is keyed on mtime at ONE-SECOND granularity,
+          # and an edit-and-check cycle is milliseconds — the same hazard `canfail`
+          # documents, and it bit this very check while it was being written.
+          dunder=$(PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=python python3 -c "import restore_verified; print(restore_verified.__version__)")
 
           # THE CENTRAL GATE. A version in two files is a version that disagrees with
           # itself at the next bump, and the failure is silent: both halves publish,
           # both installs succeed, and they are not the same release.
           if [ "$version" != "$js_version" ]; then
             echo "::error::pyproject.toml says $version and package.json says $js_version"
+            exit 1
+          fi
+          if [ "$version" != "$dunder" ]; then
+            echo "::error::pyproject.toml says $version and __version__ says $dunder"
             exit 1
           fi
           if [ "$name" != "$js_name" ]; then
