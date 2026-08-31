@@ -182,7 +182,18 @@ jobs:
           fi
 
   cli:
-    # The shipped entry points, exercised end to end. Importing the module proves the
+    # The shipped entry points, exercised end to end.
+    #
+    # PYTHONPATH IS DELIBERATELY EMPTY HERE, and it cost a red build to learn why. The
+    # workflow-level `PYTHONPATH: python` is what lets the test jobs import the package
+    # without installing it — and it also lets *pip* import it, which made pip announce
+    # "restore-verified is already installed with the same version as the provided
+    # wheel", skip the install, and produce no console script. The job that exists to
+    # prove the built artifact works must not inherit the shortcut that makes the source
+    # importable, or it is testing the source tree while believing it is testing a wheel.
+    env:
+      PYTHONPATH: ''
+ Importing the module proves the
     # module imports; it does not prove `pip install` gives you a working command.
     runs-on: ubuntu-latest
     steps:
@@ -219,7 +230,7 @@ jobs:
           # else -- and `No such file or directory` distinguishes none of them.
           echo "venv scripts:"; ls -1 /tmp/venv/bin
           if [ ! -x /tmp/venv/bin/restore-verified ]; then
-            echo "::error::the wheel installed but produced no `restore-verified` script"
+            echo '::error::the wheel installed but produced no restore-verified script'
             /tmp/venv/bin/python - <<'PY'
           import importlib.metadata as md
           d = md.distribution("restore-verified")
