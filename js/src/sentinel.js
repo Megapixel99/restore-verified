@@ -95,11 +95,28 @@ export class Sentinel {
     const files = [];
     let sawDir = false;
 
+    // A SYMLINK IS NOT A `Dirent` DIRECTORY, AND THAT CRASHED THE WALK. `isDirectory()`
+    // on a `Dirent` describes the link itself, so a symlink pointing at a directory fell
+    // through to the file branch and `readFileSync` threw EISDIR — a stack trace out of
+    // `record --paths .` for a tree that merely contains a symlink. Python's `os.walk`
+    // puts a symlinked directory in `dirnames` and, not following links, never digests
+    // it; resolving the link here and skipping directories is that same behaviour, which
+    // is what keeps the two halves recording the same set of files.
+    const isDirectory = (entry, full) => {
+      if (entry.isDirectory()) return true;
+      if (!entry.isSymbolicLink()) return false;
+      try {
+        return fs.statSync(full).isDirectory();
+      } catch {
+        return false; // a broken link is not a directory; it is recorded as missing
+      }
+    };
+
     const walk = (dir) => {
       for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
         const full = path.join(dir, entry.name);
-        if (entry.isDirectory()) {
-          if (SKIP_DIRS.has(entry.name)) continue;
+        if (isDirectory(entry, full)) {
+          if (SKIP_DIRS.has(entry.name) || entry.isSymbolicLink()) continue;
           walk(full);
         } else if (!patterns || matchesAny(entry.name, patterns)) {
           files.push(full);

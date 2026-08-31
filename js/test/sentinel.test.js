@@ -78,3 +78,25 @@ test("node_modules is not walked", () => {
 test("the report says the denominator even when it is zero", () => {
   assert.match(driftReport([]), /every file matches the digest/);
 });
+
+test("a symlinked directory does not crash the walk", () => {
+  // `Dirent.isDirectory()` describes the LINK, so a symlink to a directory fell through
+  // to the file branch and `readFileSync` threw EISDIR — a stack trace out of `record`
+  // for a tree that merely contains a symlink. Python's `os.walk` does not follow links
+  // and never digests one, so neither does this.
+  const { dir, file } = fixture();
+  fs.mkdirSync(path.join(dir, "real"));
+  fs.writeFileSync(path.join(dir, "real", "inner.js"), "x\n");
+  fs.symlinkSync("real", path.join(dir, "link"), "dir");
+
+  const sentinel = Sentinel.record([dir]);
+  const recorded = Object.keys(sentinel.entries);
+  assert.ok(recorded.includes(file));
+  assert.ok(!recorded.some((p) => p.includes(`${path.sep}link`)), "the link was followed");
+});
+
+test("a broken symlink is recorded as missing rather than throwing", () => {
+  const { dir } = fixture();
+  fs.symlinkSync(path.join(dir, "nowhere"), path.join(dir, "dangling"));
+  assert.doesNotThrow(() => Sentinel.record([dir]));
+});

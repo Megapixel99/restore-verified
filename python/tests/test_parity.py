@@ -31,6 +31,7 @@ JS = os.path.join(REPO, "js", "src", "index.js")
 sys.path.insert(0, ROOT)
 
 from restore_verified import Sentinel  # noqa: E402
+from restore_verified.cli import EXIT_TIMEOUT  # noqa: E402
 from restore_verified.sentinel import MANIFEST_VERSION  # noqa: E402
 
 NODE = shutil.which("node")
@@ -72,6 +73,56 @@ class TheManifestIsOneDocument(unittest.TestCase):
             f"console.log(JSON.stringify(EXIT_DRIFT));"
         )
         self.assertEqual(js, EXIT_DRIFT)
+
+    def test_the_two_halves_agree_on_the_timeout_exit_code(self):
+        # The other number a CI file branches on. `timeout(1)`'s 124, from both halves.
+        from restore_verified.cli import EXIT_TIMEOUT
+
+        js = run_node(
+            f"import {{ EXIT_TIMEOUT }} from {json.dumps(JS)};"
+            f"console.log(JSON.stringify(EXIT_TIMEOUT));"
+        )
+        self.assertEqual(js, EXIT_TIMEOUT)
+
+    def test_the_two_halves_measure_TIMEOUT_IN_THE_SAME_UNIT(self):
+        """The flag is seconds in both halves, and this is the test that says so.
+
+        THE JAVASCRIPT HALF PASSED IT TO `spawn` UNCONVERTED, and `spawn` takes
+        milliseconds. `--timeout 600` therefore meant ten minutes to the Python half and
+        six tenths of a second to the JavaScript one, while one README documented both
+        and both shipped a binary of the same name. A CI file that set a deadline got a
+        different deadline depending on which half won the PATH — and the failure was
+        silent, because a command killed early still produces a plausible-looking report.
+
+        Asserted from the outside, through both real CLIs, because the unit is a
+        property of the command line rather than of either implementation.
+        """
+        for label, argv in (
+            ("python", [sys.executable, "-m", "restore_verified.cli"]),
+            ("javascript", [NODE, os.path.join(REPO, "js", "src", "cli.js")]),
+        ):
+            with self.subTest(half=label):
+                env = dict(os.environ, PYTHONPATH=ROOT)
+
+                # A one-second command under a five-SECOND deadline must survive. Read
+                # as milliseconds, five is a deadline of five thousandths of a second.
+                survived = subprocess.run(
+                    argv + ["run", "--paths", self.file, "--timeout", "5",
+                            "--", "sleep", "1"],
+                    capture_output=True, text=True, env=env, timeout=120,
+                )
+                self.assertEqual(
+                    survived.returncode, 0,
+                    f"{label} killed a 1s command under a 5s deadline: {survived.stderr}",
+                )
+
+                # And the deadline still bites when it is genuinely exceeded.
+                killed = subprocess.run(
+                    argv + ["run", "--paths", self.file, "--timeout", "0.3",
+                            "--", "sleep", "30"],
+                    capture_output=True, text=True, env=env, timeout=120,
+                )
+                self.assertEqual(killed.returncode, EXIT_TIMEOUT, killed.stderr)
 
     def test_the_two_halves_skip_the_same_directories(self):
         # Two halves that disagreed about what they walked would disagree about whether

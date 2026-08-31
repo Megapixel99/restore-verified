@@ -20,14 +20,15 @@
 
 import { spawn } from "node:child_process";
 import process from "node:process";
+import { pathToFileURL } from "node:url";
 
 import { Sentinel, driftReport } from "./sentinel.js";
-import { EXIT_DRIFT } from "./index.js";
+import { EXIT_DRIFT, EXIT_TIMEOUT } from "./index.js";
 
 function usage() {
   process.stderr.write(`restore-verified — run something that edits files, and prove the tree came back.
 
-  restore-verified run    --paths P... [--timeout MS] [--restore] [-v] -- COMMAND...
+  restore-verified run    --paths P... [--timeout S] [--restore] [-v] -- COMMAND...
   restore-verified record --paths P... [--manifest FILE] [--keep-content]
   restore-verified verify --manifest FILE [--restore]
 
@@ -35,8 +36,10 @@ function usage() {
   --pattern GLOB     only watch files matching this glob (repeatable)
   --keep-content     copy the files too, so they can be restored and not merely
                      checked (implied by --restore)
-  --timeout MS       SIGKILL the command after MS and verify anyway — the case
-                     this tool exists for
+  --timeout S        SIGKILL the command after S SECONDS and verify anyway — the
+                     case this tool exists for. SECONDS, not milliseconds: the
+                     Python half takes seconds and one README documents both, so a
+                     CI file must not depend on which half is installed
   --restore          put drifted files back from the snapshot (still exits ${EXIT_DRIFT})
 
 Exit: 0 the tree came back · ${EXIT_DRIFT} it did not · 2 this tool could not run ·
@@ -57,10 +60,21 @@ function parse(argv) {
       return v;
     };
     if (f === "--paths") {
-      while (flags[i + 1] !== undefined && !flags[i + 1].startsWith("--")) opts.paths.push(flags[++i]);
+      // `-` AND NOT JUST `--`. Stopping only at `--` swallowed the short flags: in
+      // `run --paths src -v -- cmd` the `-v` became a path, so the guard watched a
+      // file that does not exist and verbose silently never turned on.
+      while (flags[i + 1] !== undefined && !flags[i + 1].startsWith("-")) opts.paths.push(flags[++i]);
     } else if (f === "--pattern") opts.pattern.push(value());
     else if (f === "--manifest") opts.manifest = value();
-    else if (f === "--timeout") opts.timeout = Number(value());
+    else if (f === "--timeout") {
+      const raw = value();
+      opts.timeout = Number(raw);
+      // `Number("30s")` is NaN, and a NaN timeout is silently no timeout at all --
+      // the deadline this command exists to impose would just not be there.
+      if (!Number.isFinite(opts.timeout) || opts.timeout <= 0) {
+        throw new Error(`--timeout needs a positive number of seconds, not ${raw}`);
+      }
+    }
     else if (f === "--keep-content") opts.keepContent = true;
     else if (f === "--restore") opts.restore = true;
     else if (f === "-v" || f === "--verbose") opts.verbose = true;
@@ -72,7 +86,12 @@ function parse(argv) {
   return { cmd: flags[0], opts, command };
 }
 
-function runCommand(command, timeout) {
+// The shell's convention, and the one the Python half now reports too. A flat 137 for
+// every signal said SIGKILL when the child had died on SIGTERM, and the number is the
+// only thing a CI file gets to branch on.
+const SIGNAL_NUMBERS = { SIGHUP: 1, SIGINT: 2, SIGQUIT: 3, SIGKILL: 9, SIGTERM: 15 };
+
+function runCommand(command, timeoutSeconds) {
   return new Promise((resolve) => {
     const child = spawn(command[0], command.slice(1), {
       stdio: "inherit",
@@ -80,10 +99,16 @@ function runCommand(command, timeout) {
       // deadline does — and because a SIGTERM the child could catch would not
       // exercise the case this tool exists for.
       killSignal: "SIGKILL",
-      ...(timeout ? { timeout } : {}),
+      // SECONDS IN, MILLISECONDS TO `spawn`. The flag is seconds because the Python
+      // half's is, and one README documents both: `--timeout 600` meaning ten minutes
+      // to one half and six tenths of a second to the other is a CI file that depends
+      // on which half happened to be installed.
+      ...(timeoutSeconds ? { timeout: timeoutSeconds * 1000 } : {}),
     });
     child.on("error", (err) => resolve({ code: 2, error: err }));
-    child.on("close", (code, signal) => resolve({ code: code === null ? 137 : code, signal }));
+    child.on("close", (code, signal) =>
+      resolve({ code: code === null ? 128 + (SIGNAL_NUMBERS[signal] ?? 0) : code, signal })
+    );
   });
 }
 
@@ -100,17 +125,22 @@ async function cmdRun(opts, command) {
     process.stderr.write(`[restore-verified] recorded ${sentinel.size} file(s)\n`);
   }
 
-  const { code, signal, error } = await runCommand(command, opts.timeout);
+  let { code, signal, error } = await runCommand(command, opts.timeout);
   if (error) {
     process.stderr.write(`restore-verified: cannot run ${command[0]} (${error.message})\n`);
     sentinel.discard();
     return 2;
   }
-  if (signal === "SIGKILL" && opts.timeout) {
+  const timedOut = signal === "SIGKILL" && Boolean(opts.timeout);
+  if (timedOut) {
     process.stderr.write(
-      `[restore-verified] the command exceeded ${opts.timeout}ms and was SIGKILLed — ` +
+      `[restore-verified] the command exceeded ${opts.timeout}s and was SIGKILLed — ` +
         `no handler, no \`finally\`, no cleanup ran\n`
     );
+    // 124, as `timeout(1)` uses and as the Python half already reported. 137 here said
+    // "killed" without saying "by the deadline", and said something different from the
+    // other half for the same event.
+    code = EXIT_TIMEOUT;
   }
 
   const drift = sentinel.verify();
@@ -193,17 +223,36 @@ export async function main(argv) {
     usage();
     return cmd ? 0 : 2;
   }
-  if (cmd === "run") return cmdRun(opts, command);
-  if (cmd === "record") return cmdRecord(opts);
-  if (cmd === "verify") return cmdVerify(opts);
+  // EVERY COMMAND'S THROW IS THIS TOOL FAILING TO RUN, WHICH IS EXIT 2 AND A SENTENCE.
+  // A missing manifest, or `verify --restore` against a digest-only one, used to reject
+  // the promise `main` returns: Node printed a stack trace and exited 1, which is the
+  // status a CI file reads as "the command under test failed" rather than "this tool
+  // could not run". Both are documented paths, not exotic ones.
+  try {
+    if (cmd === "run") return await cmdRun(opts, command);
+    if (cmd === "record") return cmdRecord(opts);
+    if (cmd === "verify") return cmdVerify(opts);
+  } catch (err) {
+    process.stderr.write(`restore-verified: ${err.message}\n`);
+    return 2;
+  }
   usage();
   return 2;
 }
 
+// `pathToFileURL` rather than `file://` + the raw path: the latter is not a URL on
+// Windows (`file://C:\\...`) and mis-encodes any path with a `#` or a space in it, and
+// when it does not match, the shipped `bin` silently does nothing at all.
 const invokedDirectly =
-  process.argv[1] && import.meta.url === new URL(`file://${process.argv[1]}`).href;
+  process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href;
 if (invokedDirectly) {
-  main(process.argv.slice(2)).then((code) => {
-    process.exitCode = code;
-  });
+  main(process.argv.slice(2)).then(
+    (code) => {
+      process.exitCode = code;
+    },
+    (err) => {
+      process.stderr.write(`restore-verified: ${err.stack || err.message}\n`);
+      process.exitCode = 2;
+    }
+  );
 }

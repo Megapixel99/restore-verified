@@ -3,7 +3,7 @@
 [![PyPI](https://img.shields.io/pypi/v/restore-verified?label=PyPI&color=3775A9)](https://pypi.org/project/restore-verified/)
 [![npm](https://img.shields.io/npm/v/restore-verified?label=npm&color=CB3837)](https://www.npmjs.com/package/restore-verified)
 [![ci](https://github.com/Megapixel99/restore-verified/actions/workflows/ci.yml/badge.svg?branch=master)](https://github.com/Megapixel99/restore-verified/actions/workflows/ci.yml)
-[![license MIT](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
+[![license MIT](https://img.shields.io/badge/license-MIT-blue)](https://github.com/Megapixel99/restore-verified/blob/master/LICENSE)
 
 Temporarily modify a file, survive the signal, and **prove the tree came back**.
 
@@ -183,7 +183,7 @@ does not work; taking it from the snapshot makes the mistake unavailable.
 test cache and a file watcher all key on mtime, and a guard that triggers a full rebuild
 on every run is a guard people switch off.
 
-> **The tension, found by building [`canfail`](../canfail) on top of this.** If your tool
+> **The tension, found by building `canfail` on top of this.** If your tool
 > *compiles or imports* the file it just restored, restoring mtime is wrong: a bytecode
 > cache written from the broken source then looks fresh. Worse, `restore_mtime=False` is
 > **not sufficient** either — mtime invalidation has one-second granularity, and an
@@ -240,9 +240,16 @@ restore-verified record --paths src/ --manifest before.json
 restore-verified verify --manifest before.json [--restore]
 ```
 
+`--timeout` is **seconds** in both halves, and the parity suite asserts it through both
+real CLIs rather than trusting either to be right about itself — a deadline that meant
+seconds to one half and milliseconds to the other would make a CI file depend on which
+binary won the PATH.
+
 Exit code **3** means the tree did not come back — its own code, never folded into the
 command's status, because a harness that exits 0 having left a file mutated is the exact
-failure this exists to report.
+failure this exists to report. **124** is the deadline expiring, as `timeout(1)` reports
+it; **2** is this tool failing to run; a command killed by a signal reports **128+n**, as
+a shell does. Both halves produce the same number for the same event.
 
 `--restore` still exits 3. That this command could put the tree back makes the run
 recoverable, not trustworthy.
@@ -263,8 +270,8 @@ recoverable, not trustworthy.
 ## Tests
 
 ```sh
-python3 -m unittest discover -s python/tests   # 32, including the cross-half contract
-npm test                                       # 22
+python3 -m unittest discover -s python/tests   # 41, including the cross-half contract
+npm test                                       # 33
 ```
 
 No dependencies in either half. The signal tests spawn a real child and really kill it,
