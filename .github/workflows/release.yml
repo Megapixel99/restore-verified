@@ -1,0 +1,163 @@
+# Nothing is published that the suite has not run against, and nothing is published twice.
+#
+# A publish cannot be taken back. So every step is guarded by its own answer to "is this
+# already published?", and a run that failed halfway can be repeated with
+# workflow_dispatch: it will do only what is still missing rather than failing on
+# "already exists".
+#
+# PyPI is given no long-lived token. Publishing uses trusted publishing (OIDC): the
+# runner mints a short-lived token, PyPI checks its claims against a publisher
+# registered for this repository AND this workflow filename, and a leaked secret is not
+# a thing this repository has to own.
+#
+# UNTIL THAT PUBLISHER IS REGISTERED, the publish step fails with an authentication
+# error and nothing else is wrong. Register it at
+# https://pypi.org/manage/account/publishing/ with:
+#
+#     owner:            Megapixel99
+#     repository:       restore-verified
+#     workflow name:    release.yml
+#     environment:      pypi
+#
+# The version is read from `pyproject.toml` and is the single source of truth. It is
+# never typed into this file, because a version in two places is a version that
+# disagrees with itself at the next bump.
+name: Release
+
+on:
+  push:
+    branches: [master]
+    # A version bump always touches this file. It is a cheap pre-filter, not the
+    # decision — the `check` job below still asks PyPI before anything is published.
+    paths:
+      - 'pyproject.toml'
+  # Lets a partially failed release be finished without another commit.
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    name: Is anything unpublished?
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.read.outputs.version }}
+      name: ${{ steps.read.outputs.name }}
+      pypi_missing: ${{ steps.read.outputs.pypi_missing }}
+      tag_missing: ${{ steps.read.outputs.tag_missing }}
+      release_needed: ${{ steps.read.outputs.release_needed }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          # Tags are needed to answer "does this tag already exist?", and the default
+          # shallow fetch does not bring them.
+          fetch-depth: 0
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.12'
+
+      - id: read
+        name: Read the version, then ask the registry rather than assume
+        run: |
+          set -euo pipefail
+          read -r name version < <(python3 - <<'PY'
+          import tomllib
+          with open("pyproject.toml", "rb") as fh:
+              p = tomllib.load(fh)["project"]
+          print(p["name"], p["version"])
+          PY
+          )
+          echo "name=$name"       >> "$GITHUB_OUTPUT"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "releasing $name $version"
+
+          # `curl -f` fails on 404, which is exactly "this version is not on PyPI".
+          if curl -fsS -o /dev/null "https://pypi.org/pypi/$name/$version/json"; then
+            pypi_missing=false
+          else
+            pypi_missing=true
+          fi
+
+          if git rev-parse -q --verify "refs/tags/v$version" > /dev/null; then
+            tag_missing=false
+          else
+            tag_missing=true
+          fi
+
+          echo "pypi_missing=$pypi_missing" >> "$GITHUB_OUTPUT"
+          echo "tag_missing=$tag_missing"   >> "$GITHUB_OUTPUT"
+          if [ "$pypi_missing" = true ] || [ "$tag_missing" = true ]; then
+            echo "release_needed=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "release_needed=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::$name $version is already on PyPI and already tagged; nothing to do"
+          fi
+
+  test:
+    # THE FULL SUITE, CALLED RATHER THAN COPIED. A release gate that has drifted from
+    # the suite it claims to be is worse than no gate, and a copy drifts the first time
+    # a job is added to ci.yml.
+    name: The suite
+    needs: check
+    if: needs.check.outputs.release_needed == 'true'
+    uses: ./.github/workflows/ci.yml
+
+  pypi:
+    name: Publish to PyPI
+    needs: [check, test]
+    if: needs.check.outputs.pypi_missing == 'true'
+    runs-on: ubuntu-latest
+    environment: pypi
+    permissions:
+      id-token: write   # mint the OIDC token PyPI's trusted publishing verifies
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.12'
+
+      - name: Build
+        run: |
+          python3 -m pip install --quiet build
+          python3 -m build --outdir dist
+
+      - name: The artifact is what the tag says
+        # A wheel whose filename does not carry the version in pyproject.toml means the
+        # build read something else, and the thing uploaded would not be the thing
+        # tested. Cheap to check, and silent if it is ever wrong.
+        run: |
+          set -euo pipefail
+          version='${{ needs.check.outputs.version }}'
+          ls -1 dist
+          if ! ls dist/*.whl | grep -q -- "-$version-"; then
+            echo "::error::no wheel in dist/ carries version $version"
+            exit 1
+          fi
+
+      - name: Publish
+        # No password, no token. PyPI verifies the OIDC token minted above against a
+        # trusted publisher registered for this repository and this workflow file.
+        uses: pypa/gh-action-pypi-publish@release/v1
+
+  tag:
+    name: Tag the release
+    needs: [check, test]
+    if: needs.check.outputs.tag_missing == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Create the tag and the GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ needs.check.outputs.version }}
+        run: |
+          set -euo pipefail
+          git tag "v$VERSION"
+          git push origin "v$VERSION"
+          gh release create "v$VERSION" --generate-notes --title "v$VERSION"

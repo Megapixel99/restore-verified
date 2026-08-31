@@ -1,0 +1,147 @@
+# A package that promises to put your files back has to answer for its own tree.
+#
+# Two gates here are not boilerplate. Each is this package's own property, pointed back
+# at the package:
+#
+#   1. THE TREE MUST BE CLEAN AFTERWARDS. The suite deliberately breaks files and
+#      restores them, and it kills a real child process mid-edit to prove SIGTERM does
+#      not skip the restore. If a restore is ever missed, the tally still prints and the
+#      damage shows up in the NEXT commit — which is exactly the failure `Sentinel`
+#      exists to catch, so it would be absurd for CI not to check it here.
+#
+#   2. THE SIGNAL TESTS MUST ACTUALLY RUN. They are the reason this package exists, and
+#      they are the ones a sandbox is most likely to skip silently. Counting them is
+#      cheap; discovering a year later that the interesting half never ran is not.
+#
+# Action versions are pinned at v7 deliberately. Older majors still run, on a Node the
+# runner silently substitutes, and a pin that is wrong for its own runtime is invisible
+# in a pass/fail — you only see it in an annotation nobody reads.
+name: ci
+
+on:
+  push:
+    # `master` only. A branch with an open PR matches both triggers and every job runs
+    # twice, and a concurrency group does NOT fix it: the push event keys on
+    # `refs/heads/<branch>` while the pull_request event keys on `<branch>`, so they
+    # land in different groups.
+    branches: [master]
+  pull_request:
+  workflow_dispatch:
+  # `release.yml` calls this workflow rather than copying the jobs into itself. A
+  # release gate that has drifted from the suite it claims to be is worse than no gate,
+  # and a copy drifts the first time a job is added here.
+  workflow_call:
+
+concurrency:
+  # `github.workflow` is part of the key because a version-bump push matches BOTH this
+  # workflow and `release.yml`, and `release.yml` calls this one. Without it both land
+  # in the same group and `cancel-in-progress` cancels the release's own test run — a
+  # gate cancelled by the push that needs it.
+  group: ci-${{ github.workflow }}-${{ github.head_ref || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  suite:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # The floor is what `pyproject.toml` claims, and the claim is checked rather
+        # than trusted: `requires-python = ">=3.9"` is a promise, and a promise nothing
+        # runs is the stale-documentation defect in a metadata file.
+        python-version: ['3.9', '3.12', '3.13']
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: no dependencies, and that is a design constraint
+        # A guard that drags in a dependency tree is one more thing that can break the
+        # build it was added to protect. Asserted, because `pyproject.toml` saying
+        # `dependencies = []` is a claim about the code, not a check of it.
+        run: |
+          if python3 -c "import restore_verified, restore_verified.cli" 2>&1 \
+             | grep -q "ModuleNotFoundError"; then
+            echo "::error::restore_verified imported something outside the standard library"
+            exit 1
+          fi
+          python3 -c "import restore_verified as r; print('restore-verified', r.__version__)"
+
+      - name: the suites
+        run: python3 -m unittest discover -s tests -v
+
+      - name: the signal tests are not silently skipped
+        # These spawn a real child and really kill it. A sandbox that refuses to deliver
+        # signals would make them vanish rather than fail, and the package would ship
+        # with its whole premise untested and a green tick.
+        run: |
+          out=$(python3 -m unittest discover -s tests -v 2>&1)
+          echo "$out" | grep -c "SIGTERM\|SIGKILL\|SIGINT" > /tmp/n
+          n=$(cat /tmp/n)
+          echo "signal tests observed: $n"
+          if [ "$n" -lt 4 ]; then
+            echo "::error::expected at least 4 signal tests, saw $n"
+            exit 1
+          fi
+
+      - name: the tree came back
+        # The suite breaks files on purpose. This is `Sentinel.verify()` asked of the
+        # checkout itself, and a package that could not pass it has no business
+        # offering the check to anybody else.
+        run: |
+          if [ -n "$(git status --porcelain)" ]; then
+            echo "::error::the suite left the tree dirty — a restore was skipped"
+            git status --porcelain
+            git diff
+            exit 1
+          fi
+          echo "clean"
+
+  cli:
+    # The shipped entry point, exercised end to end. Importing the module proves the
+    # module imports; it does not prove `pip install` gives you a working command.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.12'
+
+      - name: install the built artifact, not the source tree
+        # A packaging mistake — a missing module in `packages`, a broken entry point —
+        # is invisible when the tests import from the working directory.
+        run: |
+          python3 -m pip install --quiet build
+          python3 -m build --wheel --outdir /tmp/dist
+          python3 -m pip install --quiet /tmp/dist/*.whl
+          cd /tmp   # away from the source tree, so an import can only come from the wheel
+          restore-verified --help
+
+      - name: the timeout case, which is the one with no incumbent
+        # A harness with a perfect in-process guard, SIGKILLed by a deadline, leaves the
+        # tree broken. That is the motivating example in the README, so it is run rather
+        # than described.
+        run: |
+          mkdir -p /tmp/demo && printf 'def f(x):\n    return x + 1\n' > /tmp/demo/m.py
+          cat > /tmp/demo/harness.py <<'PY'
+          import time
+          from restore_verified import guarded
+          with guarded("/tmp/demo/m.py") as g:
+              g.write("MUTATED\n")
+              time.sleep(60)
+          PY
+          set +e
+          restore-verified run --paths /tmp/demo/m.py --timeout 3 -- python3 /tmp/demo/harness.py
+          code=$?
+          set -e
+          echo "exit=$code"
+          if [ "$code" -ne 3 ]; then
+            echo "::error::expected exit 3 (the tree did not come back), got $code"
+            exit 1
+          fi
+          if ! grep -q MUTATED /tmp/demo/m.py; then
+            echo "::error::the file was restored, so this run proved nothing"
+            exit 1
+          fi
+          echo "the SIGKILL case was detected, as documented"
