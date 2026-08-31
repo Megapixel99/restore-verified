@@ -19,3 +19,8 @@ export {
 // its own rather than reusing 1 — and it is the same 3 the Python half uses, because a
 // CI file should not have to ask which half produced the number it is branching on.
 export const EXIT_DRIFT = 3;
+
+// The deadline expired. `timeout(1)`'s number, and the Python half's — exported for the
+// same reason 3 is: it is a number a CI file branches on, so the two halves are held to
+// it by the parity suite rather than by each half being trusted about itself.
+export const EXIT_TIMEOUT = 124;
