@@ -1,0 +1,51 @@
+{
+  "name": "restore-verified",
+  "version": "0.1.0",
+  "description": "Temporarily modify a file, survive the signal, and prove the tree came back.",
+  "keywords": [
+    "restore",
+    "rollback",
+    "in-place",
+    "codemod",
+    "signal",
+    "sigterm",
+    "sigkill",
+    "timeout",
+    "crash-safe",
+    "verify",
+    "checksum",
+    "mutation-testing",
+    "ci",
+    "zero-dependency"
+  ],
+  "license": "MIT",
+  "type": "module",
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "bin": {
+    "restore-verified": "js/src/cli.js"
+  },
+  "exports": {
+    ".": "./js/src/index.js",
+    "./guard": "./js/src/guard.js",
+    "./sentinel": "./js/src/sentinel.js"
+  },
+  "files": [
+    "js/src",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "test": "node --test js/test/*.test.js"
+  },
+  "dependencies": {},
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Megapixel99/restore-verified.git"
+  },
+  "bugs": {
+    "url": "https://github.com/Megapixel99/restore-verified/issues"
+  },
+  "homepage": "https://github.com/Megapixel99/restore-verified#readme"
+}

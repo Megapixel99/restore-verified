@@ -5,6 +5,11 @@ Temporarily modify a file, survive the signal, and **prove the tree came back**.
 For anything that breaks a file on purpose and puts it back: a mutation harness, a
 codemod, a benchmark that swaps a config, a test that patches a fixture.
 
+```sh
+pip install restore-verified      # the Python half
+npm install restore-verified      # the JavaScript half
+```
+
 ```python
 from restore_verified import guarded
 
@@ -13,6 +18,19 @@ with guarded("src/parser.py") as g:
     run_the_suite()
 # restored here — and the restore is checked, byte for byte
 ```
+
+```js
+import { guarded } from "restore-verified";
+
+await guarded("src/parser.js", async (g) => {
+  g.write(g.read().replace("<=", "<"));
+  await runTheSuite();
+});
+// restored here — and the restore is checked, byte for byte
+```
+
+JavaScript has no `with`, so the callback is what brackets the work. It is not sugar:
+it is the only shape that puts the restore in a `finally` the caller cannot forget.
 
 ```sh
 # the case nothing else covers: the tool is SIGKILLed by a timeout mid-edit
@@ -97,6 +115,45 @@ $ echo $?
 
 That harness had a flawless guard. The check has to live in whatever invoked it.
 
+## Two halves, one manifest
+
+The half that breaks a tree and the half that checks it came back are frequently not the
+same process, and frequently not the same language — a Node build script invoking a
+Python codemod, a Python CI harness shelling out to `jscodeshift`. So `Sentinel` writes
+**one document**, and that is a claim about bytes rather than about intentions:
+
+```sh
+# a Python harness records, a Node script verifies — or the other way round
+python3 -m restore_verified.cli record --paths src/ --manifest before.json
+npx restore-verified verify --manifest before.json
+```
+
+`python/tests/test_parity.py` asserts it in both directions: Python writes a manifest and
+JavaScript verifies against it, JavaScript writes one and Python **restores** from it,
+and both halves produce **byte-identical manifests for the same tree**. Verdicts agreeing
+proves the two read the document the same way; bytes agreeing proves they write it the
+same way, which is what stops one half quietly adding a field the other ignores. The
+version number, the drift exit code and the skipped-directory list are asserted equal
+too.
+
+### What is different in JavaScript, and why
+
+Two things, and neither is cosmetic.
+
+**A signal handler cannot unwind an awaited body.** In Python the handler raises, the
+`with` block unwinds, and the restore happens on the ordinary path. Node has no such
+path — a handler runs as its own event-loop task and cannot inject an exception into
+whatever the body is awaiting. So the JavaScript handler performs the restore *itself*,
+synchronously, which is why every filesystem call in that half is the `...Sync` one.
+
+**Registering a handler prevents the default termination.** `process.on("SIGTERM", ...)`
+means the process no longer dies on SIGTERM, so a guard that catches, restores and
+returns has converted `kill` into "nothing happened". The handler therefore removes
+itself and re-raises the signal — and that turned out to have an edge of its own: a
+registered signal listener is also a handle keeping the event loop alive, so removing the
+last one can leave the loop empty and Node exits *before* the re-raised signal lands. A
+timer held across the re-raise closes it. Found by a failing test, not by reading.
+
 ## Design decisions worth knowing
 
 **A caught signal is re-delivered.** Swallowing SIGTERM turns `kill` into "nothing
@@ -156,6 +213,22 @@ for drift in Sentinel.load(manifest).verify():
     print(drift)
 ```
 
+```js
+import { guarded, Sentinel, RestoreFailed } from "restore-verified";
+
+await guarded(["a.js", "b.js"], async (g) => {   // one file or many
+  g.write("a.js", mutatedText);
+});
+// RestoreFailed if anything did not come back byte for byte
+
+const sentinel = Sentinel.record(["src/"]);       // add { keepContent: true } to restore
+const manifest = sentinel.save();
+for (const drift of Sentinel.load(manifest).verify()) console.log(String(drift));
+```
+
+Both halves ship the same CLI, with the same flags and the same exit codes — a CI file
+should not have to ask which one is installed:
+
 ```sh
 restore-verified run --paths src/ [--timeout N] [--restore] -- CMD...
 restore-verified record --paths src/ --manifest before.json
@@ -185,10 +258,11 @@ recoverable, not trustworthy.
 ## Tests
 
 ```sh
-python3 -m unittest discover -s tests
+python3 -m unittest discover -s python/tests   # 32, including the cross-half contract
+npm test                                       # 22
 ```
 
-25 tests, no dependencies. The signal tests spawn a real child and really kill it,
+No dependencies in either half. The signal tests spawn a real child and really kill it,
 because the question is not "does the handler run" but "what does the file on disk look
 like after somebody types `kill`".
 

@@ -16,7 +16,7 @@ known point rather than racing the interpreter's start-up.
 import sys
 import time
 
-sys.path.insert(0, __file__.rsplit("/tests/", 1)[0])
+sys.path.insert(0, __file__.rsplit("/tests/", 1)[0])   # python/
 
 from restore_verified import guarded  # noqa: E402
 

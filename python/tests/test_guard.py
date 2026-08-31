@@ -16,7 +16,7 @@ import time
 import unittest
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-ROOT = os.path.dirname(HERE)
+ROOT = os.path.dirname(HERE)          # python/, which is where the package lives
 sys.path.insert(0, ROOT)
 
 from restore_verified import RestoreFailed, Sentinel, guarded  # noqa: E402

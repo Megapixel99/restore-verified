@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "restore-verified"
-version = "0.0.1"
+version = "0.1.0"
 description = "Temporarily modify a file, survive the signal, and prove the tree came back."
 readme = "README.md"
 requires-python = ">=3.9"
@@ -27,4 +27,7 @@ dependencies = []
 restore-verified = "restore_verified.cli:main"
 
 [tool.setuptools]
+# The Python half lives in `python/` beside `js/`, and is still imported as
+# `restore_verified`.
+package-dir = { "" = "python" }
 packages = ["restore_verified"]

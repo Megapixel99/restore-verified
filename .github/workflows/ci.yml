@@ -1,7 +1,12 @@
 # A package that promises to put your files back has to answer for its own tree.
 #
-# Two gates here are not boilerplate. Each is this package's own property, pointed back
-# at the package:
+# It ships TWO HALVES from one tree -- `restore-verified` on PyPI and `restore-verified`
+# on npm -- so there is a third gate beside the two below: the halves must agree about
+# the manifest, byte for byte. A `Sentinel` record written by a Python harness is read
+# by a Node build script and the other way round, and "one document" is a claim about
+# bytes rather than about intentions.
+#
+# The other two gates are this package's own properties, pointed back at the package:
 #
 #   1. THE TREE MUST BE CLEAN AFTERWARDS. The suite deliberately breaks files and
 #      restores them, and it kills a real child process mid-edit to prove SIGTERM does
@@ -32,6 +37,14 @@ on:
   # and a copy drifts the first time a job is added here.
   workflow_call:
 
+# The Python half lives in `python/` beside `js/`, and is still IMPORTED as
+# `restore_verified`. Nothing here installs the package for the test jobs -- a tool that
+# guards your build should not need a build of its own -- so the interpreter is told
+# where to find it once, here, instead of every step carrying a prefix that one of them
+# would eventually be missing.
+env:
+  PYTHONPATH: python
+
 concurrency:
   # `github.workflow` is part of the key because a version-bump push matches BOTH this
   # workflow and `release.yml`, and `release.yml` calls this one. Without it both land
@@ -41,7 +54,7 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  suite:
+  python:
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
@@ -69,14 +82,14 @@ jobs:
           python3 -c "import restore_verified as r; print('restore-verified', r.__version__)"
 
       - name: the suites
-        run: python3 -m unittest discover -s tests -v
+        run: python3 -m unittest discover -s python/tests -v
 
       - name: the signal tests are not silently skipped
         # These spawn a real child and really kill it. A sandbox that refuses to deliver
         # signals would make them vanish rather than fail, and the package would ship
         # with its whole premise untested and a green tick.
         run: |
-          out=$(python3 -m unittest discover -s tests -v 2>&1)
+          out=$(python3 -m unittest discover -s python/tests -v 2>&1)
           echo "$out" | grep -c "SIGTERM\|SIGKILL\|SIGINT" > /tmp/n
           n=$(cat /tmp/n)
           echo "signal tests observed: $n"
@@ -98,8 +111,78 @@ jobs:
           fi
           echo "clean"
 
+  javascript:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # `package.json` says `>=18`, and `node:test` is what the suites use.
+        node-version: ['18', '22', '24']
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: ${{ matrix.node-version }}
+
+      - name: no dependencies here either
+        run: |
+          if [ -d node_modules ]; then
+            echo "::error::node_modules is committed"
+            exit 1
+          fi
+          node -e "const p=require('./package.json');
+                   if (Object.keys(p.dependencies||{}).length) {
+                     console.error('::error::package.json declares dependencies');
+                     process.exit(1);
+                   }
+                   console.log('restore-verified', p.version)"
+
+      - name: the suites
+        run: node --test js/test/*.test.js
+
+      - name: the tree came back
+        run: |
+          if [ -n "$(git status --porcelain)" ]; then
+            echo "::error::the suite left the tree dirty — a restore was skipped"
+            git status --porcelain
+            exit 1
+          fi
+
+  parity:
+    # THE TWO HALVES AGREE ABOUT THE MANIFEST, OR THE MANIFEST IS NOT A CONTRACT.
+    # A record written by one half is read by the other in the field; if they disagree
+    # about a key or a version number, one of them silently refuses a document the
+    # other treats as valid, and a tree nobody checked is reported as checked.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.12'
+      - uses: actions/setup-node@v7
+        with:
+          node-version: '24'
+
+      - name: the halves agree, and the test was not skipped
+        # `skipUnless(node)` keeps the suite runnable for a Python-only contributor. In
+        # CI a skip and a pass look identical in a tally, so the count is asserted --
+        # which is this package's own `evidence` property applied to its own gate.
+        run: |
+          out=$(python3 -m unittest discover -s python/tests -p 'test_parity.py' -v 2>&1)
+          echo "$out"
+          if echo "$out" | grep -q "skipped"; then
+            echo "::error::the parity tests were SKIPPED, so nothing checked the contract"
+            exit 1
+          fi
+          ran=$(echo "$out" | grep -c " \.\.\. ok")
+          echo "parity assertions that ran: $ran"
+          if [ "$ran" -lt 7 ]; then
+            echo "::error::expected at least 7 parity tests, saw $ran"
+            exit 1
+          fi
+
   cli:
-    # The shipped entry point, exercised end to end. Importing the module proves the
+    # The shipped entry points, exercised end to end. Importing the module proves the
     # module imports; it does not prove `pip install` gives you a working command.
     runs-on: ubuntu-latest
     steps:
@@ -108,15 +191,29 @@ jobs:
         with:
           python-version: '3.12'
 
-      - name: install the built artifact, not the source tree
-        # A packaging mistake — a missing module in `packages`, a broken entry point —
-        # is invisible when the tests import from the working directory.
+      - uses: actions/setup-node@v7
+        with:
+          node-version: '24'
+
+      - name: install the built artifacts, not the source tree
+        # A packaging mistake — a missing module in `packages`, a `files` list that
+        # omits a source directory, a broken entry point — is invisible when the tests
+        # import from the working directory.
         run: |
           python3 -m pip install --quiet build
           python3 -m build --wheel --outdir /tmp/dist
           python3 -m pip install --quiet /tmp/dist/*.whl
-          cd /tmp   # away from the source tree, so an import can only come from the wheel
+          npm pack --pack-destination /tmp/dist
+          cd /tmp   # away from the source tree, so nothing can resolve from it
+
+          # BOTH HALVES SHIP A BINARY CALLED `restore-verified`, so installing both
+          # globally would leave the PATH deciding which one this step tested. The
+          # wheel's console script is exercised by name; the tarball is unpacked and
+          # its entry point run directly, which also proves `files` in package.json
+          # carries everything the CLI imports.
           restore-verified --help
+          mkdir -p /tmp/tarball && tar -xzf /tmp/dist/restore-verified-*.tgz -C /tmp/tarball
+          node /tmp/tarball/package/js/src/cli.js --help
 
       - name: the timeout case, which is the one with no incumbent
         # A harness with a perfect in-process guard, SIGKILLed by a deadline, leaves the

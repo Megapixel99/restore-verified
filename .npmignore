@@ -1,0 +1,6 @@
+# `files` in package.json is the allowlist and it is what npm actually uses. This exists
+# for the tools that read .npmignore instead, so the two never disagree about whether a
+# tarball carries the Python half.
+python/
+js/test/
+.github/

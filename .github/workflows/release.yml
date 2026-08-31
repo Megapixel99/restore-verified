@@ -1,4 +1,12 @@
-# Nothing is published that the suite has not run against, and nothing is published twice.
+# One version, two registries, and nothing published that the suite has not run against.
+#
+# This package ships twice from one tree -- `restore-verified` on PyPI and
+# `restore-verified` on npm -- and that is the failure mode the `check` job exists to
+# prevent. Two version numbers in two files drift the moment one of them is bumped
+# alone, and the result is not a broken build: it is `pip install restore-verified` and
+# `npm install restore-verified` behaving differently while one README describes both.
+# So the versions are COMPARED before anything is uploaded, rather than each half being
+# trusted to be right about itself.
 #
 # A publish cannot be taken back. So every step is guarded by its own answer to "is this
 # already published?", and a run that failed halfway can be repeated with
@@ -10,14 +18,16 @@
 # registered for this repository AND this workflow filename, and a leaked secret is not
 # a thing this repository has to own.
 #
-# UNTIL THAT PUBLISHER IS REGISTERED, the publish step fails with an authentication
-# error and nothing else is wrong. Register it at
-# https://pypi.org/manage/account/publishing/ with:
+# UNTIL THOSE PUBLISHERS ARE REGISTERED, the publish steps fail with an authentication
+# error and nothing else is wrong. Register them with:
 #
-#     owner:            Megapixel99
-#     repository:       restore-verified
-#     workflow name:    release.yml
-#     environment:      pypi
+#   PyPI  https://pypi.org/manage/account/publishing/
+#     owner: Megapixel99   repository: restore-verified
+#     workflow: release.yml   environment: pypi
+#
+#   npm   the package's Settings -> Trusted publisher, on npmjs.com
+#     organization/user: Megapixel99   repository: restore-verified
+#     workflow: release.yml   environment: npm
 #
 # The version is read from `pyproject.toml` and is the single source of truth. It is
 # never typed into this file, because a version in two places is a version that
@@ -45,6 +55,7 @@ jobs:
       version: ${{ steps.read.outputs.version }}
       name: ${{ steps.read.outputs.name }}
       pypi_missing: ${{ steps.read.outputs.pypi_missing }}
+      npm_missing: ${{ steps.read.outputs.npm_missing }}
       tag_missing: ${{ steps.read.outputs.tag_missing }}
       release_needed: ${{ steps.read.outputs.release_needed }}
     steps:
@@ -57,8 +68,12 @@ jobs:
         with:
           python-version: '3.12'
 
+      - uses: actions/setup-node@v7
+        with:
+          node-version: '24'
+
       - id: read
-        name: Read the version, then ask the registry rather than assume
+        name: Do the versions agree, and is anything unpublished?
         run: |
           set -euo pipefail
           read -r name version < <(python3 - <<'PY'
@@ -68,9 +83,24 @@ jobs:
           print(p["name"], p["version"])
           PY
           )
+          js_name=$(node -p "require('./package.json').name")
+          js_version=$(node -p "require('./package.json').version")
+
+          # THE CENTRAL GATE. A version in two files is a version that disagrees with
+          # itself at the next bump, and the failure is silent: both halves publish,
+          # both installs succeed, and they are not the same release.
+          if [ "$version" != "$js_version" ]; then
+            echo "::error::pyproject.toml says $version and package.json says $js_version"
+            exit 1
+          fi
+          if [ "$name" != "$js_name" ]; then
+            echo "::error::pyproject.toml names $name and package.json names $js_name"
+            exit 1
+          fi
+
           echo "name=$name"       >> "$GITHUB_OUTPUT"
           echo "version=$version" >> "$GITHUB_OUTPUT"
-          echo "releasing $name $version"
+          echo "releasing $name $version to both registries"
 
           # `curl -f` fails on 404, which is exactly "this version is not on PyPI".
           if curl -fsS -o /dev/null "https://pypi.org/pypi/$name/$version/json"; then
@@ -85,13 +115,21 @@ jobs:
             tag_missing=true
           fi
 
+          # `npm view` exits non-zero when that exact version is not published.
+          if npm view "$name@$version" version > /dev/null 2>&1; then
+            npm_missing=false
+          else
+            npm_missing=true
+          fi
+
           echo "pypi_missing=$pypi_missing" >> "$GITHUB_OUTPUT"
+          echo "npm_missing=$npm_missing"   >> "$GITHUB_OUTPUT"
           echo "tag_missing=$tag_missing"   >> "$GITHUB_OUTPUT"
-          if [ "$pypi_missing" = true ] || [ "$tag_missing" = true ]; then
+          if [ "$pypi_missing" = true ] || [ "$npm_missing" = true ] || [ "$tag_missing" = true ]; then
             echo "release_needed=true" >> "$GITHUB_OUTPUT"
           else
             echo "release_needed=false" >> "$GITHUB_OUTPUT"
-            echo "::notice::$name $version is already on PyPI and already tagged; nothing to do"
+            echo "::notice::$name $version is already on both registries and already tagged"
           fi
 
   test:
@@ -139,6 +177,44 @@ jobs:
         # No password, no token. PyPI verifies the OIDC token minted above against a
         # trusted publisher registered for this repository and this workflow file.
         uses: pypa/gh-action-pypi-publish@release/v1
+
+  npm:
+    name: Publish to npm
+    needs: [check, test]
+    if: needs.check.outputs.npm_missing == 'true'
+    runs-on: ubuntu-latest
+    environment: npm
+    permissions:
+      id-token: write   # mint the OIDC token npm trusted publishing verifies
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: '24'
+          registry-url: 'https://registry.npmjs.org'
+
+      - name: The tarball carries the JavaScript half and nothing else
+        # `files` in package.json is an allowlist, and an allowlist that quietly stopped
+        # matching ships a package whose entry point is not in it. Cheap to check.
+        run: |
+          set -euo pipefail
+          npm pack --pack-destination /tmp
+          tar -tzf /tmp/restore-verified-*.tgz | sort
+          if tar -tzf /tmp/restore-verified-*.tgz | grep -q "package/python/"; then
+            echo "::error::the npm tarball carries the Python half"
+            exit 1
+          fi
+          for required in package/js/src/index.js package/js/src/cli.js package/js/src/guard.js package/js/src/sentinel.js; do
+            if ! tar -tzf /tmp/restore-verified-*.tgz | grep -qx "$required"; then
+              echo "::error::the npm tarball is missing $required"
+              exit 1
+            fi
+          done
+
+      - name: Publish
+        # No token. npm verifies the OIDC token minted above against a trusted
+        # publisher registered for this repository and this workflow file.
+        run: npm publish --access public
 
   tag:
     name: Tag the release
