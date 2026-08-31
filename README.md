@@ -1,5 +1,10 @@
 # `restore-verified`
 
+[![PyPI](https://img.shields.io/pypi/v/restore-verified?label=PyPI&color=3775A9)](https://pypi.org/project/restore-verified/)
+[![npm](https://img.shields.io/npm/v/restore-verified?label=npm&color=CB3837)](https://www.npmjs.com/package/restore-verified)
+[![ci](https://github.com/Megapixel99/restore-verified/actions/workflows/ci.yml/badge.svg?branch=master)](https://github.com/Megapixel99/restore-verified/actions/workflows/ci.yml)
+[![license MIT](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
+
 Temporarily modify a file, survive the signal, and **prove the tree came back**.
 
 For anything that breaks a file on purpose and puts it back: a mutation harness, a
