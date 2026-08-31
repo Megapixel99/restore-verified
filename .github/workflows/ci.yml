@@ -211,7 +211,24 @@ jobs:
           # broken entry point when the entry point is fine. The venv makes the location
           # a fact rather than a guess.
           python3 -m venv /tmp/venv
-          /tmp/venv/bin/pip install --quiet /tmp/dist/*.whl
+          /tmp/venv/bin/pip install /tmp/dist/*.whl
+
+          # SAY WHAT IS THERE RATHER THAN FAILING WITH `command not found`. A missing
+          # console script has three causes that look identical from the shell -- the
+          # entry point is wrong, the wheel did not carry it, or pip put it somewhere
+          # else -- and `No such file or directory` distinguishes none of them.
+          echo "venv scripts:"; ls -1 /tmp/venv/bin
+          if [ ! -x /tmp/venv/bin/restore-verified ]; then
+            echo "::error::the wheel installed but produced no `restore-verified` script"
+            /tmp/venv/bin/python - <<'PY'
+          import importlib.metadata as md
+          d = md.distribution("restore-verified")
+          print("entry points the installed wheel declares:")
+          for ep in d.entry_points:
+              print(" ", ep.group, ep.name, "->", ep.value)
+          PY
+            exit 1
+          fi
 
           # BOTH HALVES SHIP A BINARY CALLED `restore-verified`, so a global install of
           # each would leave the PATH deciding which one this step tested. Each is run
