@@ -46,12 +46,12 @@ restore-verified run --paths src/ --timeout 600 --restore -- ./harness.sh
 
 `git diff --quiet` already catches an unrestored change and `git checkout -- FILE`
 already fixes it. That is free, it is correct, and it is what you should do. This
-package is for the cases where it is not true — and those are not exotic:
+package is for the cases where it is not true, and those are not exotic:
 
 | | clean tree | **dirty tree** (a developer's checkout) |
 |---|---|---|
 | `git diff --quiet` before | clean | DIRTY |
-| `git diff --quiet` after a failed restore | DIRTY — **caught** | DIRTY — **indistinguishable** |
+| `git diff --quiet` after a failed restore | DIRTY (**caught** | DIRTY) **indistinguishable** |
 | `git checkout -- FILE` | restores | **destroys the uncommitted work** |
 
 Both rows are asserted in `tests/test_guard.py::TheGitControl`, including the one that
@@ -60,14 +60,14 @@ says *if git preserved the uncommitted work, use git*.
 The reason is structural, not incidental: **a snapshot here is per-file and taken when
 you start; git's is repo-wide and taken at the last commit.** Those are the same thing
 only on a clean tree. The other cases git cannot serve at all are untracked or ignored
-files — generated code, fetched fixtures, local config — and not being in a repository:
+files (generated code, fetched fixtures, local config) and not being in a repository:
 a container, an installed package, an unpacked tarball.
 
 ## The four failures, and which layer covers each
 
 | | what covers it | what happens without it |
 |---|---|---|
-| an **exception** mid-run | `try/finally` — and every in-place-edit package on either registry | the file stays broken |
+| an **exception** mid-run | `try/finally`, and every in-place-edit package on either registry | the file stays broken |
 | a **signal** | this package's `Guard` | **`finally` does not run on SIGTERM.** No handler, no unwinding; the file stays broken |
 | the **restore itself being wrong** | this package's verification | a restore that *ran* is not a restore that *worked* |
 | **SIGKILL / a timeout** | this package's `Sentinel`, one process outward | nothing in-process can help; the file stays broken |
@@ -88,9 +88,9 @@ of this package is wrong and the test says so in those words.**
 ### The third row is the name
 
 `in-place` (PyPI) restores the original *if an exception occurs*. `fs-transaction`
-(PyPI) rolls back a failed *write*. A second sweep — PyPI's full 881,198-name index for
+(PyPI) rolls back a failed *write*. A second sweep (PyPI's full 881,198-name index for
 `restore`, `rollback`, `revert`, `atomic`, `sigterm` and `in-place`, plus web search for
-the combination — turned up nothing further. `atomically` and `write-file-atomic` (npm, 16M and
+the combination) turned up nothing further. `atomically` and `write-file-atomic` (npm, 16M and
 more downloads a week) make a write all-or-nothing. **None of them re-reads what it put
 back.** A restore can run perfectly and still be wrong: a buffer captured *after*
 mutating, a different encoding on the way out, one of the two files you touched. All
@@ -101,7 +101,7 @@ nobody wrote. Hashing before and comparing after is the only check that separate
 ### The fourth row is the one with no incumbent anywhere
 
 SIGKILL cannot be caught, blocked or handled. The ordinary way to be SIGKILLed is not
-an impatient person — it is a **timeout**. `subprocess.run(..., timeout=...)` calls
+an impatient person; it is a **timeout**. `subprocess.run(..., timeout=...)` calls
 `Popen.kill()` when the deadline passes, and so does the kill step of a CI runner that
 has waited long enough. A harness carrying a *perfect* in-process guard, invoked under a
 timeout it exceeds, leaves the tree exactly as broken as one carrying no guard at all:
@@ -123,7 +123,7 @@ That harness had a flawless guard. The check has to live in whatever invoked it.
 ## Two halves, one manifest
 
 The half that breaks a tree and the half that checks it came back are frequently not the
-same process, and frequently not the same language — a Node build script invoking a
+same process, and frequently not the same language: a Node build script invoking a
 Python codemod, a Python CI harness shelling out to `jscodeshift`. So `Sentinel` writes
 **one document**, and that is a claim about bytes rather than about intentions:
 
@@ -147,14 +147,14 @@ Two things, and neither is cosmetic.
 
 **A signal handler cannot unwind an awaited body.** In Python the handler raises, the
 `with` block unwinds, and the restore happens on the ordinary path. Node has no such
-path — a handler runs as its own event-loop task and cannot inject an exception into
+path: a handler runs as its own event-loop task and cannot inject an exception into
 whatever the body is awaiting. So the JavaScript handler performs the restore *itself*,
 synchronously, which is why every filesystem call in that half is the `...Sync` one.
 
 **Registering a handler prevents the default termination.** `process.on("SIGTERM", ...)`
 means the process no longer dies on SIGTERM, so a guard that catches, restores and
 returns has converted `kill` into "nothing happened". The handler therefore removes
-itself and re-raises the signal — and that turned out to have an edge of its own: a
+itself and re-raises the signal, and that turned out to have an edge of its own: a
 registered signal listener is also a handle keeping the event loop alive, so removing the
 last one can leave the loop empty and Node exits *before* the re-raised signal lands. A
 timer held across the re-raise closes it. Found by a failing test, not by reading.
@@ -163,11 +163,11 @@ timer held across the re-raise closes it. Found by a failing test, not by readin
 
 **A caught signal is re-delivered.** Swallowing SIGTERM turns `kill` into "nothing
 happened", which is a worse bug than the one being fixed. The guard restores the file,
-puts the handler back to the default, and re-raises the signal at itself — so the
+puts the handler back to the default, and re-raises the signal at itself, so the
 process dies with status `-15`, as the sender intended. Asserted.
 
 **`Interrupted` inherits from `BaseException`.** A bare `except Exception:` inside the
-guarded body — ordinary defensive code — would otherwise swallow the interruption and
+guarded body (ordinary defensive code) would otherwise swallow the interruption and
 keep running against a mutated tree after someone asked it to stop.
 
 **Nothing is written beside the code under test.** The snapshot lives in a temp
@@ -186,12 +186,12 @@ on every run is a guard people switch off.
 > **The tension, found by building `canfail` on top of this.** If your tool
 > *compiles or imports* the file it just restored, restoring mtime is wrong: a bytecode
 > cache written from the broken source then looks fresh. Worse, `restore_mtime=False` is
-> **not sufficient** either — mtime invalidation has one-second granularity, and an
+> **not sufficient** either: mtime invalidation has one-second granularity, and an
 > edit/run/restore cycle in milliseconds defeats it whichever way you set this. Disable
 > the cache (`PYTHONDONTWRITEBYTECODE=1`, `make -B`) rather than relying on the clock.
 
 **Off the main thread it says so.** `signal.signal` only works on the main thread, so
-there the guard degrades to a `try/finally` — and sets `g.signal_note` to explain it,
+there the guard degrades to a `try/finally`, and sets `g.signal_note` to explain it,
 rather than covering half the job silently.
 
 **Three drift outcomes, not two.** `changed`, `missing` and `created` are kept apart: a
@@ -231,7 +231,7 @@ const manifest = sentinel.save();
 for (const drift of Sentinel.load(manifest).verify()) console.log(String(drift));
 ```
 
-Both halves ship the same CLI, with the same flags and the same exit codes — a CI file
+Both halves ship the same CLI, with the same flags and the same exit codes: a CI file
 should not have to ask which one is installed:
 
 ```sh
@@ -241,11 +241,11 @@ restore-verified verify --manifest before.json [--restore]
 ```
 
 `--timeout` is **seconds** in both halves, and the parity suite asserts it through both
-real CLIs rather than trusting either to be right about itself — a deadline that meant
+real CLIs rather than trusting either to be right about itself: a deadline that meant
 seconds to one half and milliseconds to the other would make a CI file depend on which
 binary won the PATH.
 
-Exit code **3** means the tree did not come back — its own code, never folded into the
+Exit code **3** means the tree did not come back; its own code, never folded into the
 command's status, because a harness that exits 0 having left a file mutated is the exact
 failure this exists to report. **124** is the deadline expiring, as `timeout(1)` reports
 it; **2** is this tool failing to run; a command killed by a signal reports **128+n**, as
@@ -259,7 +259,7 @@ recoverable, not trustworthy.
 - **Mature mutation frameworks do not need this.** mutmut 3 copies `source_paths` to a
   `mutants/` directory and mutates the copy; StrykerJS sandboxes likewise. Avoiding
   in-place mutation is a better answer than guarding it, and if you can restructure that
-  way, do. This is for the tools that cannot — hand-rolled harnesses, codemods that must
+  way, do. This is for the tools that cannot: hand-rolled harnesses, codemods that must
   run against the real tree, anything whose build config points at the original path.
 - Zero dependencies, standard library only, Python 3.9+.
 - POSIX signals. On Windows there is no SIGTERM in the POSIX sense; the guard covers
@@ -278,7 +278,7 @@ No dependencies in either half. The signal tests spawn a real child and really k
 because the question is not "does the handler run" but "what does the file on disk look
 like after somebody types `kill`".
 
-Five mutations to the source were applied — with this package's own guard — and all five
+Five mutations to the source were applied (with this package's own guard) and all five
 were caught by the test that should catch them: removing the signal installation,
 removing the verification, dropping the re-delivery, keeping the snapshot beside the
 code, and making `verify` always report clean.
