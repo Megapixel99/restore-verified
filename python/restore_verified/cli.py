@@ -36,6 +36,50 @@ EXIT_DRIFT = 3
 EXIT_TIMEOUT = 124
 
 
+# THE USAGE TEXT, HAND-WRITTEN, AND IT IS A COPY ON PURPOSE.
+#
+# This used to be argparse's, which meant the two halves could not be compared: one
+# generated `usage: restore-verified [-h] {run,record,verify} ...` from its parser and
+# the other hand-wrote prose, so they shared no grammar and nothing could assert they
+# described the same tool. A CI file is written from whichever half its author happened
+# to read, and the flags in it are the flags that half documents.
+#
+# So the text is written out here to match the JavaScript half BYTE FOR BYTE, and
+# `test_the_usage_text_is_identical` compares the two halves' actual `--help` output
+# rather than these constants — a source comparison would pass on two strings that
+# render differently, which is how the sibling packages nearly missed the same thing.
+#
+# The cost is a second copy of forty lines, and the copy is the one that can drift. That
+# is exactly the trade `didrun` and `zerocase` both made, for the same reason: a test
+# that fails the moment they disagree is cheaper than a generator that would have to
+# produce argparse's shape and this one from one source.
+#
+# Written to STDERR and exiting 0, both of which follow the JavaScript half.
+USAGE = """restore-verified — run something that edits files, and prove the tree came back.
+
+  restore-verified run    --paths P... [--timeout S] [--restore] [-v] -- COMMAND...
+  restore-verified record --paths P... [--manifest FILE] [--keep-content]
+  restore-verified verify --manifest FILE [--restore]
+
+  --paths P...       files or directories to watch
+  --pattern GLOB     only watch files matching this glob (repeatable)
+  --keep-content     copy the files too, so they can be restored and not merely
+                     checked (implied by --restore)
+  --timeout S        SIGKILL the command after S SECONDS and verify anyway — the
+                     case this tool exists for. SECONDS, not milliseconds: the
+                     Python half takes seconds and one README documents both, so a
+                     CI file must not depend on which half is installed
+  --restore          put drifted files back from the snapshot (still exits 3)
+
+Exit: 0 the tree came back · 3 it did not · 2 this tool could not run ·
+      otherwise the command's own status.
+"""
+
+
+def _usage() -> None:
+    sys.stderr.write(USAGE)
+
+
 # THE SIGNALS A PERSON OR A RUNNER ACTUALLY SENDS, forwarded to the command's group.
 # Putting the command in its own session is what lets the deadline kill its children
 # too, and the cost is that the terminal stops delivering Ctrl-C to it: job control
@@ -290,9 +334,15 @@ def _positive_seconds(raw: str) -> float:
 
 
 def build_parser() -> argparse.ArgumentParser:
+    # `add_help=False` THROUGHOUT: `-h` is handled before argparse ever sees it, in
+    # `main`, so that both halves answer it with the same bytes. Left on, argparse would
+    # intercept `-h` first and print its own generated help. The parser still generates
+    # the usage line in its ERROR messages, which is a smaller divergence and the next
+    # thing to close.
     parser = argparse.ArgumentParser(
         prog="restore-verified",
         description="Run something that edits files in place, and prove the tree came back.",
+        add_help=False,
     )
     sub = parser.add_subparsers(dest="cmd", required=True)
 
@@ -305,7 +355,7 @@ def build_parser() -> argparse.ArgumentParser:
                        help="copy the files too, so they can be restored and not "
                             "merely checked (implied by --restore)")
 
-    run = sub.add_parser("run", help="record, run a command, then verify")
+    run = sub.add_parser("run", help="record, run a command, then verify", add_help=False)
     common(run)
     run.add_argument("--timeout", type=_positive_seconds, default=None,
                      help="seconds before the command is SIGKILLed — the case this "
@@ -318,12 +368,12 @@ def build_parser() -> argparse.ArgumentParser:
                      help="-- then the command to run")
     run.set_defaults(func=_cmd_run)
 
-    rec = sub.add_parser("record", help="write a manifest and exit")
+    rec = sub.add_parser("record", help="write a manifest and exit", add_help=False)
     common(rec)
     rec.add_argument("--manifest", help="where to write it (default: a temp file)")
     rec.set_defaults(func=_cmd_record)
 
-    ver = sub.add_parser("verify", help="check a tree against a manifest")
+    ver = sub.add_parser("verify", help="check a tree against a manifest", add_help=False)
     ver.add_argument("--manifest", required=True)
     ver.add_argument("--restore", action="store_true")
     ver.set_defaults(func=_cmd_verify)
@@ -332,6 +382,20 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv=None) -> int:
+    argv = list(sys.argv[1:] if argv is None else argv)
+
+    # ONLY THE FLAGS BEFORE `--`, because everything after it belongs to the command
+    # being guarded. `run --paths x -- pytest -h` is asking pytest for help, and a tool
+    # that answered on its behalf would swallow the run.
+    head = argv[: argv.index("--")] if "--" in argv else argv
+    if "-h" in head or "--help" in head:
+        _usage()
+        return 0
+    if not head:
+        # Bare, or nothing but a command: 2, because this tool was not told what to do.
+        _usage()
+        return 2
+
     parser = build_parser()
     args = parser.parse_args(argv)
     if getattr(args, "command", None) and args.command and args.command[0] == "--":

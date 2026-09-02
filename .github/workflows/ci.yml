@@ -336,9 +336,9 @@ jobs:
       - uses: actions/setup-node@v7
         with:
           node-version: '24'
-      - name: the gates, installed globally so the tree stays clean
-        run: npm install -g zerocase@0.1.6 @megapixel99/didrun@0.1.5
-
+      # NO GATES INSTALLED HERE ANY MORE. This job's only use for `didrun` was the
+      # `--help` check, which is now a `diff` that carries its own canary — and a gate
+      # installed but unused is a dependency this job does not have.
       - name: install the built artifacts, not the source tree
         # A packaging mistake — a missing module in `packages`, a `files` list that
         # omits a source directory, a broken entry point — is invisible when the tests
@@ -348,6 +348,8 @@ jobs:
           python3 -m pip install --quiet build
           python3 -m build --wheel --outdir /tmp/dist
           npm pack --pack-destination /tmp/dist
+
+          mkdir -p /tmp/tarball && tar -xzf /tmp/dist/restore-verified-*.tgz -C /tmp/tarball
 
           # A VENV, AND THE SCRIPT CALLED BY ABSOLUTE PATH. Installing into the runner's
           # interpreter puts the console script wherever that interpreter's scheme says,
@@ -378,27 +380,45 @@ jobs:
           # each would leave the PATH deciding which one this step tested. Each is run
           # from its own artifact instead.
           #
-          # `--help` EXITING 0 IS NOT `--help` PRINTING ANYTHING. An entry point that
-          # imports cleanly, prints nothing and returns is a working command by exit
-          # code and a broken one by every other measure — and that is the whole of what
-          # a bare `--help` step was checking. Both halves are asked to name all three
-          # subcommands instead, so a help text that lost one, or printed nothing at
-          # all, fails here.
+          # THE TWO BUILT ARTIFACTS PRINT THE SAME HELP, BYTE FOR BYTE.
           #
-          # THIS IS PRESENCE AND NOT PARITY, and the difference matters. Three positive
-          # matches cannot notice a FOURTH subcommand that one half grew and the other
-          # did not: both halves would still print `run`, `record` and `verify`, both
-          # would exit 0, and this job would be green while the two registries shipped
-          # different CLIs. Nothing in this tree compares the two surfaces; `parity`
-          # compares the manifest bytes and a hand-written list of constants.
+          # This step used to ask each half to mention `run`, `record` and `verify`,
+          # which is presence and not parity: three substring matches cannot notice a
+          # FOURTH subcommand one half grew alone, and they passed on prose anyway —
+          # the Python help contained the line `run    record, run a command, then
+          # verify`, so deleting the `verify` subparser left the word `verify` in the
+          # output and the gate green.
+          #
+          # `diff` subsumes all of it, because the subcommand list is INSIDE the text
+          # being compared. `parity` asserts the same thing against the source tree;
+          # this asserts it against the wheel and the tarball, which is the pair a user
+          # actually installs and the one a packaging mistake breaks.
           cd /tmp   # away from the source tree, so nothing can resolve from it
-          didrun --expect "run" --expect "record" --expect "verify" \
-            -- /tmp/venv/bin/restore-verified --help
-          /tmp/venv/bin/python -c "import restore_verified as r; print('wheel imports', r.__version__)"
+          /tmp/venv/bin/restore-verified --help 2>/tmp/help-py.txt >/tmp/out-py.txt
+          node /tmp/tarball/package/js/src/cli.js --help 2>/tmp/help-js.txt >/tmp/out-js.txt
 
-          mkdir -p /tmp/tarball && tar -xzf /tmp/dist/restore-verified-*.tgz -C /tmp/tarball
-          didrun --expect "run" --expect "record" --expect "verify" \
-            -- node /tmp/tarball/package/js/src/cli.js --help
+          # THE CANARY FIRST. Two empty files are byte-identical, and an entry point
+          # that imports cleanly and prints nothing is the defect this job exists to
+          # catch rather than the pass `diff` would call it.
+          for half in py js; do
+            if ! grep -q -- "--paths" /tmp/help-$half.txt; then
+              echo "::error::the $half half printed no flag list for --help"
+              head -20 /tmp/help-$half.txt
+              exit 1
+            fi
+            if [ -s /tmp/out-$half.txt ]; then
+              echo "::error::the $half half wrote its usage to stdout, not stderr"
+              exit 1
+            fi
+          done
+
+          if ! diff -u /tmp/help-py.txt /tmp/help-js.txt; then
+            echo "::error::the two halves describe different tools under one name"
+            exit 1
+          fi
+          echo "the two shipped CLIs print identical help"
+
+          /tmp/venv/bin/python -c "import restore_verified as r; print('wheel imports', r.__version__)"
 
       - name: the timeout case, which is the one with no incumbent
         # A harness with a perfect in-process guard, SIGKILLed by a deadline, leaves the
