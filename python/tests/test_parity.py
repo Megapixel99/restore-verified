@@ -27,8 +27,12 @@ release, and every one was invisible to the tests that existed at the time:
      nothing, and reported that the tree came back. The Python half got the refusal free
      from `required=True`; the JavaScript half had to write it down and did not. A
      guarantee one half gets from its parser is a guarantee nobody wrote a test for.
-  3. ERROR-PATH EXIT CODES. Every parity test here was happy-path until the row below
-     existed. `--timeout 0` was a usage error on npm and an expired deadline on PyPI.
+  3. ERROR-PATH EXIT CODES, AND THEN THE WORDS. Every parity test here was happy-path
+     until the row below existed, and `--timeout 0` was a usage error on npm and an
+     expired deadline on PyPI. The status was the first half of it: the halves also
+     refused the same command line in different sentences, because one of them was
+     generating them from `argparse` and the other hand-wrote them. A person reading one
+     registry's output could not search for the other's message. Both are compared now.
   4. A DEADLINE THAT FIRES BUT DOES NOT BOUND THE WORK. Asserting that a timeout
      *fires* is not asserting *when*. `--timeout` killed the command and returned 124 on
      time while the command's own children survived as orphans, still holding the stdout
@@ -274,12 +278,18 @@ class TheHalvesRefuseTheSameShapes(unittest.TestCase):
     direction: `run` with no `--paths` exited 0 on npm having watched nothing, and said
     "the tree came back" while doing it.
 
-    THE EXIT CODE IS COMPARED AND THE WORDING IS NOT, and that is a real limit rather
-    than an oversight. The Python half's refusals are argparse's sentences and the
-    JavaScript half's are hand-written, so `zerocase`'s word-for-word refusal table
-    cannot be ported here until this half hand-writes its usage text the way `didrun`
-    and `zerocase` both already do. Until then the assertion is that a shape is refused
-    and refused with the same number, which is what a CI file can branch on.
+    THE WORDS ARE COMPARED AND NOT ONLY THE STATUS. This was the other way round while
+    the Python half generated its refusals from `argparse`: `error: the following
+    arguments are required: --paths` against `restore-verified run: --paths is
+    required`, for the same command line, from one binary name. The status is what a CI
+    file branches on and the sentence is what a person searches for, and the halves
+    owe both.
+
+    ONE MESSAGE STAYS EACH HALF'S OWN, deliberately: the spawn failure for a command
+    that does not exist carries the runtime's text (`spawn foo ENOENT` from Node), and
+    inventing a Node-shaped sentence in Python to match would be a worse lie than the
+    difference. It is not in the table below, and it is the one refusal compared on
+    status alone.
     """
 
     def setUp(self):
@@ -299,9 +309,14 @@ class TheHalvesRefuseTheSameShapes(unittest.TestCase):
             ("a negative deadline", ["run", "--paths", self.file, "--timeout", "-1", "--", "true"]),
             ("a deadline that is not a number", ["run", "--paths", self.file, "--timeout", "abc", "--", "true"]),
             ("seconds with a unit suffix", ["run", "--paths", self.file, "--timeout", "30s", "--", "true"]),
+            ("an empty deadline", ["run", "--paths", self.file, "--timeout", "", "--", "true"]),
+            ("nothing to run after --", ["run", "--paths", self.file, "--"]),
+            ("a flag with no value", ["run", "--paths", self.file, "--manifest"]),
+            ("an unknown option", ["run", "--paths", self.file, "--nope", "--", "true"]),
+            ("an unknown subcommand", ["frobnicate"]),
         )
 
-    def test_both_halves_refuse_the_same_shapes_with_the_same_status(self):
+    def test_both_halves_refuse_the_same_shapes_in_the_same_words(self):
         env = dict(os.environ, PYTHONPATH=ROOT)
         for label, args in self.shapes():
             with self.subTest(shape=label):
@@ -309,15 +324,27 @@ class TheHalvesRefuseTheSameShapes(unittest.TestCase):
                 for half, argv in halves():
                     proc = subprocess.run(argv + args, capture_output=True, text=True,
                                           env=env, timeout=120)
-                    seen[half] = proc.returncode
+                    seen[half] = proc
                 self.assertEqual(
-                    seen["python"], seen["javascript"],
-                    f"{label}: python exited {seen['python']} and javascript exited "
-                    f"{seen['javascript']} for the same command line",
+                    seen["python"].returncode, seen["javascript"].returncode,
+                    f"{label}: python exited {seen['python'].returncode} and javascript "
+                    f"exited {seen['javascript'].returncode} for the same command line",
                 )
                 self.assertEqual(
-                    seen["python"], 2,
-                    f"{label}: expected 2 (this tool could not run), got {seen['python']}",
+                    seen["python"].returncode, 2,
+                    f"{label}: expected 2 (this tool could not run), got "
+                    f"{seen['python'].returncode}",
+                )
+                # THE CANARY, for the same reason the usage comparison has one: two
+                # empty refusals are equal, and a tool that refuses in silence is the
+                # defect rather than the pass.
+                self.assertTrue(
+                    seen["python"].stderr.strip(),
+                    f"{label}: refused with exit 2 and said nothing",
+                )
+                self.assertEqual(
+                    seen["python"].stderr, seen["javascript"].stderr,
+                    f"{label}: the halves refuse the same command line differently",
                 )
 
     def test_a_run_that_watches_nothing_never_reports_that_the_tree_came_back(self):

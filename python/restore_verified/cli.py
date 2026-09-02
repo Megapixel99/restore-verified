@@ -15,7 +15,6 @@ does, which no test runner, CI step or mutation framework currently does.
 
 from __future__ import annotations
 
-import argparse
 import math
 import os
 import signal
@@ -120,7 +119,120 @@ def _signal_the_group(proc, pgid, sig) -> None:
         pass
 
 
+class _Refused(Exception):
+    """A command line this tool will not act on, carrying the sentence to print.
+
+    `restore-verified: ` is prepended once, in `main`, exactly as the JavaScript half
+    prepends it in the `catch` around its own parse.
+    """
+
+
+def _to_number(raw: str) -> float:
+    """JavaScript's `Number()`, closely enough that both halves refuse the same strings.
+
+    `float()` alone is not it. `Number("")` is 0 and `float("")` raises; `Number("0x10")`
+    is 16 and `float("0x10")` raises. Neither is a string anybody types at a deadline,
+    but the two halves refusing DIFFERENT sets of nonsense is the drift this file exists
+    to stop, and it costs four lines to not have.
+    """
+    text = raw.strip()
+    if text == "":
+        return 0.0
+    try:
+        return float(text)
+    except ValueError:
+        pass
+    try:
+        return float(int(text, 0))
+    except ValueError:
+        return float("nan")
+
+
+class _Options:
+    """What the command line said, with the same defaults as the other half's object."""
+
+    def __init__(self) -> None:
+        self.paths = []
+        self.pattern = []
+        self.manifest = None
+        self.timeout = None
+        self.keep_content = False
+        self.restore = False
+        self.verbose = False
+        self.help = False
+        self.command = []
+
+
+def _parse(argv):
+    """Read the command line, refusing in the same words as the JavaScript half.
+
+    HAND-ROLLED, AND THAT IS THE POINT. This was `argparse`, which meant every refusal
+    was argparse's sentence: `error: the following arguments are required: --paths`
+    against the other half's `restore-verified run: --paths is required`. Two tools
+    under one name, refusing the same command line differently, and a person reading one
+    registry's output cannot search for the other's message.
+
+    The structure follows the other half's `parse()` clause for clause so that the two
+    can be read side by side, which is the only maintenance story a second copy has.
+    """
+    sep = argv.index("--") if "--" in argv else -1
+    flags = argv if sep == -1 else argv[:sep]
+    opts = _Options()
+    opts.command = [] if sep == -1 else argv[sep + 1 :]
+
+    i = 0
+    while i < len(flags):
+        f = flags[i]
+
+        def value():
+            nonlocal i
+            i += 1
+            if i >= len(flags):
+                raise _Refused(f"{f} needs a value")
+            return flags[i]
+
+        if f == "--paths":
+            # `-` AND NOT JUST `--`. Stopping only at `--` swallowed the short flags: in
+            # `run --paths src -v -- cmd` the `-v` became a path, so the guard watched a
+            # file that does not exist and verbose silently never turned on.
+            while i + 1 < len(flags) and not flags[i + 1].startswith("-"):
+                i += 1
+                opts.paths.append(flags[i])
+        elif f == "--pattern":
+            opts.pattern.append(value())
+        elif f == "--manifest":
+            opts.manifest = value()
+        elif f == "--timeout":
+            raw = value()
+            seconds = _to_number(raw)
+            # `--timeout 0` and `--timeout -1` are not deadlines, and NaN is silently no
+            # deadline at all -- the one thing this command exists to impose.
+            if not math.isfinite(seconds) or seconds <= 0:
+                raise _Refused(
+                    f"--timeout needs a positive number of seconds, not {raw}"
+                )
+            opts.timeout = seconds
+        elif f == "--keep-content":
+            opts.keep_content = True
+        elif f == "--restore":
+            opts.restore = True
+        elif f in ("-v", "--verbose"):
+            opts.verbose = True
+        elif f in ("-h", "--help"):
+            opts.help = True
+        elif i > 0 or f not in ("run", "record", "verify"):
+            raise _Refused(f"unknown option {f}")
+        i += 1
+
+    return (flags[0] if flags else None), opts
+
+
 def _cmd_run(args) -> int:
+    # BEFORE the empty-command check, and in this order in both halves: a caller who
+    # omits both is told about `--paths` rather than about `--`.
+    if not args.paths:
+        sys.stderr.write("restore-verified run: --paths is required\n")
+        return 2
     if not args.command:
         sys.stderr.write("restore-verified run: nothing to run after `--`\n")
         return 2
@@ -263,6 +375,9 @@ def _cmd_run(args) -> int:
 
 
 def _cmd_record(args) -> int:
+    if not args.paths:
+        sys.stderr.write("restore-verified record: --paths is required\n")
+        return 2
     sentinel = Sentinel.record(
         args.paths, keep_content=args.keep_content, patterns=args.pattern or None
     )
@@ -276,6 +391,9 @@ def _cmd_record(args) -> int:
 
 
 def _cmd_verify(args) -> int:
+    if not args.manifest:
+        sys.stderr.write("restore-verified verify: --manifest is required\n")
+        return 2
     try:
         sentinel = Sentinel.load(args.manifest)
     except (OSError, ValueError) as exc:
@@ -302,105 +420,36 @@ def _cmd_verify(args) -> int:
     return EXIT_DRIFT if drift else 0
 
 
-def _positive_seconds(raw: str) -> float:
-    """`--timeout` in seconds, refused unless it is a real deadline.
-
-    `--timeout 0` AND `--timeout -1` ARE NOT DEADLINES, and this half used to treat them
-    as ones that had already expired: `subprocess.run` SIGKILLed the child before it
-    could do anything and this reported 124, which reads as "your command overran" about
-    a command that never got to start. The JavaScript half already refused both with 2,
-    so the same command line meant "kill it instantly" on PyPI and "you have made a
-    mistake" on npm.
-
-    Refusing is the side that was chosen because 2 is what this tool reports when it
-    cannot run, and a deadline of zero is a typo in every case anybody has had. It also
-    leaves the npm half's behaviour unchanged.
-
-    NaN and infinity are refused here too, for the reason the JavaScript half gives:
-    `float("30s")` raises, but a timeout that came through as NaN would silently be no
-    deadline at all — the one thing this command exists to impose.
-    """
-    try:
-        seconds = float(raw)
-    except (TypeError, ValueError):
-        raise argparse.ArgumentTypeError(
-            f"needs a positive number of seconds, not {raw!r}"
-        )
-    if not math.isfinite(seconds) or seconds <= 0:
-        raise argparse.ArgumentTypeError(
-            f"needs a positive number of seconds, not {raw!r}"
-        )
-    return seconds
-
-
-def build_parser() -> argparse.ArgumentParser:
-    # `add_help=False` THROUGHOUT: `-h` is handled before argparse ever sees it, in
-    # `main`, so that both halves answer it with the same bytes. Left on, argparse would
-    # intercept `-h` first and print its own generated help. The parser still generates
-    # the usage line in its ERROR messages, which is a smaller divergence and the next
-    # thing to close.
-    parser = argparse.ArgumentParser(
-        prog="restore-verified",
-        description="Run something that edits files in place, and prove the tree came back.",
-        add_help=False,
-    )
-    sub = parser.add_subparsers(dest="cmd", required=True)
-
-    def common(p):
-        p.add_argument("--paths", nargs="+", required=True,
-                       help="files or directories to watch")
-        p.add_argument("--pattern", action="append",
-                       help="only watch files matching this glob (repeatable)")
-        p.add_argument("--keep-content", action="store_true",
-                       help="copy the files too, so they can be restored and not "
-                            "merely checked (implied by --restore)")
-
-    run = sub.add_parser("run", help="record, run a command, then verify", add_help=False)
-    common(run)
-    run.add_argument("--timeout", type=_positive_seconds, default=None,
-                     help="seconds before the command is SIGKILLed — the case this "
-                          "tool exists for")
-    run.add_argument("--restore", action="store_true",
-                     help="put drifted files back from the snapshot (still exits %d)"
-                          % EXIT_DRIFT)
-    run.add_argument("-v", "--verbose", action="store_true")
-    run.add_argument("command", nargs=argparse.REMAINDER,
-                     help="-- then the command to run")
-    run.set_defaults(func=_cmd_run)
-
-    rec = sub.add_parser("record", help="write a manifest and exit", add_help=False)
-    common(rec)
-    rec.add_argument("--manifest", help="where to write it (default: a temp file)")
-    rec.set_defaults(func=_cmd_record)
-
-    ver = sub.add_parser("verify", help="check a tree against a manifest", add_help=False)
-    ver.add_argument("--manifest", required=True)
-    ver.add_argument("--restore", action="store_true")
-    ver.set_defaults(func=_cmd_verify)
-
-    return parser
-
-
 def main(argv=None) -> int:
     argv = list(sys.argv[1:] if argv is None else argv)
-
-    # ONLY THE FLAGS BEFORE `--`, because everything after it belongs to the command
-    # being guarded. `run --paths x -- pytest -h` is asking pytest for help, and a tool
-    # that answered on its behalf would swallow the run.
-    head = argv[: argv.index("--")] if "--" in argv else argv
-    if "-h" in head or "--help" in head:
-        _usage()
-        return 0
-    if not head:
-        # Bare, or nothing but a command: 2, because this tool was not told what to do.
-        _usage()
+    try:
+        cmd, opts = _parse(argv)
+    except _Refused as exc:
+        sys.stderr.write(f"restore-verified: {exc}\n")
         return 2
 
-    parser = build_parser()
-    args = parser.parse_args(argv)
-    if getattr(args, "command", None) and args.command and args.command[0] == "--":
-        args.command = args.command[1:]
-    return args.func(args)
+    # `--help` exits 0 and a bare invocation exits 2, both writing the usage to stderr,
+    # and both halves derive that from the same two facts in the same order.
+    if opts.help or not cmd:
+        _usage()
+        return 0 if cmd else 2
+
+    # EVERY COMMAND'S RAISE IS THIS TOOL FAILING TO RUN, WHICH IS EXIT 2 AND A SENTENCE.
+    # A traceback here is the status a CI file reads as "the command under test failed"
+    # rather than "this tool could not run", and both are documented paths.
+    try:
+        if cmd == "run":
+            return _cmd_run(opts)
+        if cmd == "record":
+            return _cmd_record(opts)
+        if cmd == "verify":
+            return _cmd_verify(opts)
+    except (OSError, ValueError) as exc:
+        sys.stderr.write(f"restore-verified: {exc}\n")
+        return 2
+
+    _usage()
+    return 2
 
 
 if __name__ == "__main__":  # pragma: no cover
