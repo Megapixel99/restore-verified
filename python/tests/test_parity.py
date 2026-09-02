@@ -14,6 +14,27 @@ two implementations that will disagree on the day it matters.
 The tests skip — loudly, with a reason — when `node` is not on PATH, so a Python-only
 contributor can still run the suite. CI asserts they were not skipped, because a skipped
 parity test and a passing one look identical in a tally.
+
+THE FOUR HAZARDS THIS FAMILY HAS ACTUALLY SHIPPED, so the next person writing a row here
+starts from a checklist rather than from imagination. Every one of them was found after
+release, and every one was invisible to the tests that existed at the time:
+
+  1. UNIT OF MEASURE. `--timeout 600` meant ten minutes to one half and six tenths of a
+     second to the other (this package, 0.1.2; and again in `didrun` 0.1.2-0.1.4, which
+     is the reason this list is prose the next repo can copy rather than a library it
+     would have to depend on).
+  2. AN UNENFORCED REQUIRED FLAG. `run` with no `--paths` recorded nothing, watched
+     nothing, and reported that the tree came back. The Python half got the refusal free
+     from `required=True`; the JavaScript half had to write it down and did not. A
+     guarantee one half gets from its parser is a guarantee nobody wrote a test for.
+  3. ERROR-PATH EXIT CODES. Every parity test here was happy-path until the row below
+     existed. `--timeout 0` was a usage error on npm and an expired deadline on PyPI.
+  4. A DEADLINE THAT FIRES BUT DOES NOT BOUND. Asserting that a timeout *fires* is not
+     asserting *when*. `didrun` 0.1.5 passed a purpose-written unit test while a
+     `--timeout 2` run took five seconds, because the kill reached the child and the
+     grandchild held the pipe open. Comparison cannot catch this: two halves that both
+     overrun agree perfectly. It needs a flat assertion on elapsed time, which is why
+     one lives below next to the comparative rows.
 """
 
 import json
@@ -22,6 +43,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -35,6 +57,18 @@ from restore_verified.cli import EXIT_TIMEOUT  # noqa: E402
 from restore_verified.sentinel import MANIFEST_VERSION  # noqa: E402
 
 NODE = shutil.which("node")
+
+
+def halves():
+    """The two shipped command lines, which is the only place the contract is real.
+
+    Both are invoked as the user invokes them rather than imported, because every hazard
+    in the module docstring lived in argument handling — the layer an import skips.
+    """
+    return (
+        ("python", [sys.executable, "-m", "restore_verified.cli"]),
+        ("javascript", [NODE, os.path.join(REPO, "js", "src", "cli.js")]),
+    )
 
 
 def run_node(script):
@@ -216,3 +250,139 @@ class TheManifestIsOneDocument(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
+
+
+@unittest.skipUnless(NODE, "node is not on PATH, so the cross-half contract cannot be checked")
+class TheHalvesRefuseTheSameShapes(unittest.TestCase):
+    """The error paths, which is where the halves actually drifted.
+
+    EVERY OTHER PARITY TEST IN THIS FILE IS HAPPY-PATH, and both defects this class was
+    written for lived one branch off it. A half that accepts what the other refuses is
+    two different programs wearing one name, and the accepting one is not the safe
+    direction: `run` with no `--paths` exited 0 on npm having watched nothing, and said
+    "the tree came back" while doing it.
+
+    THE EXIT CODE IS COMPARED AND THE WORDING IS NOT, and that is a real limit rather
+    than an oversight. The Python half's refusals are argparse's sentences and the
+    JavaScript half's are hand-written, so `zerocase`'s word-for-word refusal table
+    cannot be ported here until this half hand-writes its usage text the way `didrun`
+    and `zerocase` both already do. Until then the assertion is that a shape is refused
+    and refused with the same number, which is what a CI file can branch on.
+    """
+
+    def setUp(self):
+        self.dir = tempfile.mkdtemp(prefix="rv-refuse-")
+        self.file = os.path.join(self.dir, "m.txt")
+        with open(self.file, "w") as fh:
+            fh.write("ORIGINAL\n")
+
+    # (label, argv-after-the-program). 2 is what this tool reports when it cannot run,
+    # and the shapes below are the ones a person actually types.
+    def shapes(self):
+        return (
+            ("run without --paths", ["run", "--", "true"]),
+            ("record without --paths", ["record"]),
+            ("verify without --manifest", ["verify"]),
+            ("a zero deadline", ["run", "--paths", self.file, "--timeout", "0", "--", "true"]),
+            ("a negative deadline", ["run", "--paths", self.file, "--timeout", "-1", "--", "true"]),
+            ("a deadline that is not a number", ["run", "--paths", self.file, "--timeout", "abc", "--", "true"]),
+            ("seconds with a unit suffix", ["run", "--paths", self.file, "--timeout", "30s", "--", "true"]),
+        )
+
+    def test_both_halves_refuse_the_same_shapes_with_the_same_status(self):
+        env = dict(os.environ, PYTHONPATH=ROOT)
+        for label, args in self.shapes():
+            with self.subTest(shape=label):
+                seen = {}
+                for half, argv in halves():
+                    proc = subprocess.run(argv + args, capture_output=True, text=True,
+                                          env=env, timeout=120)
+                    seen[half] = proc.returncode
+                self.assertEqual(
+                    seen["python"], seen["javascript"],
+                    f"{label}: python exited {seen['python']} and javascript exited "
+                    f"{seen['javascript']} for the same command line",
+                )
+                self.assertEqual(
+                    seen["python"], 2,
+                    f"{label}: expected 2 (this tool could not run), got {seen['python']}",
+                )
+
+    def test_a_run_that_watches_nothing_never_reports_that_the_tree_came_back(self):
+        """The defect itself, asserted on the file rather than on the exit code.
+
+        `restore-verified run -- cmd` with no `--paths` printed `recorded 0 file(s)` and
+        then `the tree came back: every file matches the digest recorded before the run`
+        and exited 0, while the command it had just run destroyed the file it was
+        pointed at. A zero denominator reporting clean, under this package's own name.
+
+        The command really does mutate the file, so a half that runs it at all fails
+        here twice over — on the status and on the bytes.
+        """
+        env = dict(os.environ, PYTHONPATH=ROOT)
+        for half, argv in halves():
+            with self.subTest(half=half):
+                with open(self.file, "w") as fh:
+                    fh.write("ORIGINAL\n")
+                proc = subprocess.run(
+                    argv + ["run", "--", "sh", "-c", f"echo MUTATED > {self.file}"],
+                    capture_output=True, text=True, env=env, timeout=120,
+                )
+                self.assertEqual(proc.returncode, 2, f"{half} ran a guard over no paths")
+                self.assertNotIn("the tree came back", proc.stdout + proc.stderr)
+                with open(self.file) as fh:
+                    self.assertEqual(
+                        fh.read(), "ORIGINAL\n",
+                        f"{half} ran the command despite watching nothing",
+                    )
+
+
+@unittest.skipUnless(NODE, "node is not on PATH, so the cross-half contract cannot be checked")
+class TheDeadlineBoundsTheRun(unittest.TestCase):
+    """A timeout that fires is not a timeout that bounds, and only one of those is the promise.
+
+    COMPARISON CANNOT CATCH THIS, which is why the assertion here is a flat number and
+    not a diff between the halves. `didrun` 0.1.5 shipped a `--timeout 2` that took five
+    seconds, and it did so while passing a test written one day earlier for exactly that
+    flag — because that test asked whether the deadline fired, and both halves reported
+    that it had. Two halves that both overrun agree perfectly, so a parity suite made
+    only of comparisons is blind here by construction.
+
+    The mechanism there was piped stdio: killing the direct child leaves a grandchild
+    holding the pipe open, so the runner waits for the grandchild anyway. This half uses
+    inherited stdio and does not have the bug — this row exists so that a future change
+    to piped output cannot introduce it silently.
+    """
+
+    def setUp(self):
+        self.dir = tempfile.mkdtemp(prefix="rv-deadline-")
+        self.file = os.path.join(self.dir, "m.txt")
+        with open(self.file, "w") as fh:
+            fh.write("ORIGINAL\n")
+
+    def test_a_one_second_deadline_bounds_a_thirty_second_command_in_both_halves(self):
+        env = dict(os.environ, PYTHONPATH=ROOT)
+        # Generous, because this asserts a BOUND rather than a stopwatch reading: a
+        # loaded CI runner may take real time to start an interpreter. Ten seconds still
+        # fails a deadline that did not bound a thirty-second command at all, which is
+        # the defect, and does not fail on a slow machine, which is not.
+        ceiling = 10.0
+        for half, argv in halves():
+            with self.subTest(half=half):
+                # A GRANDCHILD, deliberately: `sh -c` puts a `sleep` behind the process
+                # actually signalled, which is the shape that survived the sibling's
+                # test. The documented usage of this flag (`-- ./harness.sh`) is exactly
+                # this shape.
+                started = time.monotonic()
+                proc = subprocess.run(
+                    argv + ["run", "--paths", self.file, "--timeout", "1",
+                            "--", "sh", "-c", "sleep 30"],
+                    capture_output=True, text=True, env=env, timeout=120,
+                )
+                elapsed = time.monotonic() - started
+                self.assertEqual(proc.returncode, EXIT_TIMEOUT, proc.stderr)
+                self.assertLess(
+                    elapsed, ceiling,
+                    f"{half} reported the deadline fired but took {elapsed:.1f}s to "
+                    f"bound a 30s command under --timeout 1",
+                )

@@ -16,6 +16,7 @@ does, which no test runner, CI step or mutation framework currently does.
 from __future__ import annotations
 
 import argparse
+import math
 import subprocess
 import sys
 
@@ -152,6 +153,37 @@ def _cmd_verify(args) -> int:
     return EXIT_DRIFT if drift else 0
 
 
+def _positive_seconds(raw: str) -> float:
+    """`--timeout` in seconds, refused unless it is a real deadline.
+
+    `--timeout 0` AND `--timeout -1` ARE NOT DEADLINES, and this half used to treat them
+    as ones that had already expired: `subprocess.run` SIGKILLed the child before it
+    could do anything and this reported 124, which reads as "your command overran" about
+    a command that never got to start. The JavaScript half already refused both with 2,
+    so the same command line meant "kill it instantly" on PyPI and "you have made a
+    mistake" on npm.
+
+    Refusing is the side that was chosen because 2 is what this tool reports when it
+    cannot run, and a deadline of zero is a typo in every case anybody has had. It also
+    leaves the npm half's behaviour unchanged.
+
+    NaN and infinity are refused here too, for the reason the JavaScript half gives:
+    `float("30s")` raises, but a timeout that came through as NaN would silently be no
+    deadline at all — the one thing this command exists to impose.
+    """
+    try:
+        seconds = float(raw)
+    except (TypeError, ValueError):
+        raise argparse.ArgumentTypeError(
+            f"needs a positive number of seconds, not {raw!r}"
+        )
+    if not math.isfinite(seconds) or seconds <= 0:
+        raise argparse.ArgumentTypeError(
+            f"needs a positive number of seconds, not {raw!r}"
+        )
+    return seconds
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="restore-verified",
@@ -170,7 +202,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     run = sub.add_parser("run", help="record, run a command, then verify")
     common(run)
-    run.add_argument("--timeout", type=float, default=None,
+    run.add_argument("--timeout", type=_positive_seconds, default=None,
                      help="seconds before the command is SIGKILLed — the case this "
                           "tool exists for")
     run.add_argument("--restore", action="store_true",
