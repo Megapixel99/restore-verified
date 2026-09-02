@@ -91,24 +91,117 @@ function parse(argv) {
 // only thing a CI file gets to branch on.
 const SIGNAL_NUMBERS = { SIGHUP: 1, SIGINT: 2, SIGQUIT: 3, SIGKILL: 9, SIGTERM: 15 };
 
+// The signals a person or a runner actually sends, forwarded to the command's group.
+const FORWARDED = ["SIGINT", "SIGTERM", "SIGHUP"];
+
+// `detached` means a new process group on POSIX and a new CONSOLE on Windows, where
+// negative pids are not a thing either. There the direct child is all there is.
+const GROUPS = process.platform !== "win32";
+
+/**
+ * Signal the command's whole process group, falling back to the command alone.
+ *
+ * The negative pid is the group. This throws once the group is gone — a race that
+ * cannot be avoided, since the command may exit between the deadline firing and the
+ * signal landing — so the failure is swallowed and the direct child is signalled
+ * instead, which is what this did before the group existed and is never worse.
+ */
+function signalGroup(child, sig) {
+  // `child.pid` OUTLIVES THE CHILD, which is what makes this work after the command
+  // itself has died — the common case, because the first signal usually kills the shell
+  // and leaves its workers behind. Those survivors are the ones still holding the
+  // inherited stdout, so a group signal that only worked while the leader was alive
+  // would miss exactly the processes it was added for.
+  if (GROUPS && child.pid) {
+    try {
+      process.kill(-child.pid, sig);
+      return;
+    } catch {
+      // ESRCH — the whole group is gone, which is the outcome we wanted. Fall through.
+    }
+  }
+  try {
+    child.kill(sig);
+  } catch {
+    // Already gone, which is the outcome we wanted.
+  }
+}
+
 function runCommand(command, timeoutSeconds) {
   return new Promise((resolve) => {
     const child = spawn(command[0], command.slice(1), {
       stdio: "inherit",
-      // SIGKILL rather than the default SIGTERM, to mirror what a real runner's
-      // deadline does — and because a SIGTERM the child could catch would not
-      // exercise the case this tool exists for.
-      killSignal: "SIGKILL",
-      // SECONDS IN, MILLISECONDS TO `spawn`. The flag is seconds because the Python
-      // half's is, and one README documents both: `--timeout 600` meaning ten minutes
-      // to one half and six tenths of a second to the other is a CI file that depends
-      // on which half happened to be installed.
-      ...(timeoutSeconds ? { timeout: timeoutSeconds * 1000 } : {}),
+      // A NEW PROCESS GROUP, SO THE DEADLINE REACHES THE WHOLE TREE. `spawn`'s own
+      // `timeout` kills the command and nothing below it, so a harness that spawns
+      // workers — which `-- ./harness.sh` and `-- npx jscodeshift` both are — outlived
+      // its own deadline as an orphan still holding the stdout this process inherited.
+      // The tool returned 124 on time and any caller capturing output waited for the
+      // work anyway.
+      detached: GROUPS,
     });
-    child.on("error", (err) => resolve({ code: 2, error: err }));
-    child.on("close", (code, signal) =>
-      resolve({ code: code === null ? 128 + (SIGNAL_NUMBERS[signal] ?? 0) : code, signal })
-    );
+
+    // FORWARDING IS WHAT BUYS BACK WHAT THE GROUP COSTS. Terminal signals go to the
+    // foreground process group, which after `detached` is this process alone, so
+    // without this a Ctrl-C would stop the tool and leave the command running.
+    //
+    // THE SECOND SIGNAL ESCALATES, and it has to, because forwarding alone can hang. A
+    // background job in a non-interactive shell has SIGINT set to ignore — POSIX, not a
+    // quirk — so `-- sh -c 'worker & wait'` survives a forwarded Ctrl-C and this
+    // process would wait for it forever. Waiting is right, since the tree still has to
+    // be verified, but waiting FOREVER is worse than the leak it replaced. The first
+    // signal is passed on as sent; a second of any kind SIGKILLs the group.
+    let forwardedOnce = false;
+    const listeners = new Map();
+    for (const sig of FORWARDED) {
+      const onSignal = () => {
+        if (forwardedOnce) return signalGroup(child, "SIGKILL");
+        forwardedOnce = true;
+        signalGroup(child, sig);
+      };
+      listeners.set(sig, onSignal);
+      process.on(sig, onSignal);
+    }
+
+    // SIGKILL rather than SIGTERM on the deadline, to mirror what a real runner's
+    // deadline does — and because a SIGTERM the command could catch would not exercise
+    // the case this tool exists for.
+    //
+    // SECONDS IN, MILLISECONDS TO `setTimeout`. The flag is seconds because the Python
+    // half's is, and one README documents both: `--timeout 600` meaning ten minutes to
+    // one half and six tenths of a second to the other is a CI file that depends on
+    // which half happened to be installed.
+    let timedOut = false;
+    const timer = timeoutSeconds
+      ? setTimeout(() => {
+          timedOut = true;
+          signalGroup(child, "SIGKILL");
+        }, timeoutSeconds * 1000)
+      : null;
+
+    const done = (result) => {
+      if (timer) clearTimeout(timer);
+      for (const [sig, onSignal] of listeners) process.removeListener(sig, onSignal);
+      resolve(result);
+    };
+
+    child.on("error", (err) => done({ code: 2, error: err }));
+    child.on("close", (code, signal) => {
+      // THE SWEEP, and it is the half that actually fixes the reported defect. Killing
+      // the command does not kill what the command started, and the leftovers hold the
+      // stdout this process inherited — so the caller waits for them however promptly
+      // this one returns. Only when this process did the killing: a command that exits
+      // on its own may have left something running deliberately, and that is not this
+      // tool's business.
+      if (timedOut || forwardedOnce) signalGroup(child, "SIGKILL");
+      done({
+        code: code === null ? 128 + (SIGNAL_NUMBERS[signal] ?? 0) : code,
+        signal,
+        // REPORTED RATHER THAN INFERRED. This used to be re-derived by the caller as
+        // "SIGKILL and a deadline was set", which also claimed a deadline for a command
+        // somebody else SIGKILLed.
+        timedOut,
+      });
+    });
   });
 }
 
@@ -143,13 +236,12 @@ async function cmdRun(opts, command) {
     process.stderr.write(`[restore-verified] recorded ${sentinel.size} file(s)\n`);
   }
 
-  let { code, signal, error } = await runCommand(command, opts.timeout);
+  let { code, error, timedOut } = await runCommand(command, opts.timeout);
   if (error) {
     process.stderr.write(`restore-verified: cannot run ${command[0]} (${error.message})\n`);
     sentinel.discard();
     return 2;
   }
-  const timedOut = signal === "SIGKILL" && Boolean(opts.timeout);
   if (timedOut) {
     process.stderr.write(
       `[restore-verified] the command exceeded ${opts.timeout}s and was SIGKILLed — ` +

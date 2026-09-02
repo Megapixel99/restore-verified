@@ -17,6 +17,8 @@ from __future__ import annotations
 
 import argparse
 import math
+import os
+import signal
 import subprocess
 import sys
 
@@ -34,6 +36,46 @@ EXIT_DRIFT = 3
 EXIT_TIMEOUT = 124
 
 
+# THE SIGNALS A PERSON OR A RUNNER ACTUALLY SENDS, forwarded to the command's group.
+# Putting the command in its own session is what lets the deadline kill its children
+# too, and the cost is that the terminal stops delivering Ctrl-C to it: job control
+# signals go to the foreground process group, which after `start_new_session` is this
+# process alone. Forwarding is what buys the isolation back.
+_FORWARDED = tuple(
+    getattr(signal, name) for name in ("SIGINT", "SIGTERM", "SIGHUP")
+    if hasattr(signal, name)
+)
+
+_POSIX = os.name == "posix"
+
+
+def _signal_the_group(proc, pgid, sig) -> None:
+    """Signal the command's whole process group, falling back to the command alone.
+
+    THE GROUP ID IS PASSED IN, READ ONCE AT SPAWN, and that is the entire point. Asking
+    `os.getpgid(proc.pid)` at signal time fails the moment the command itself has died —
+    which is the common case, because the first signal usually kills the shell and
+    leaves its children behind. Looking the group up through a corpse meant the
+    survivors were never signalled at all, and they are the ones still holding the
+    inherited stdout.
+
+    `os.killpg` still raises once the whole group is gone, which is a race that cannot
+    be avoided: the command may exit between the deadline firing and the signal landing.
+    Falling back to the direct child is what this did before the group existed and is
+    never worse.
+    """
+    if pgid is not None:
+        try:
+            os.killpg(pgid, sig)
+            return
+        except (ProcessLookupError, PermissionError, OSError):
+            pass
+    try:
+        proc.send_signal(sig)
+    except (ProcessLookupError, OSError):
+        pass
+
+
 def _cmd_run(args) -> int:
     if not args.command:
         sys.stderr.write("restore-verified run: nothing to run after `--`\n")
@@ -47,9 +89,59 @@ def _cmd_run(args) -> int:
         sys.stderr.write(f"[restore-verified] recorded {len(sentinel)} file(s)\n")
 
     killed = False
+    # A NEW SESSION, SO THE DEADLINE REACHES THE WHOLE TREE. `subprocess.run(timeout=)`
+    # kills the command and nothing below it, so a harness that spawns workers -- which
+    # is what `-- ./harness.sh` and `-- npx jscodeshift` both are -- outlived its own
+    # deadline as an orphan, still holding the stdout this process inherited. The tool
+    # returned 124 on time and any caller capturing output waited for the work anyway.
     try:
-        completed = subprocess.run(args.command, timeout=args.timeout)
-        code = completed.returncode
+        proc = subprocess.Popen(args.command, start_new_session=_POSIX)
+    except FileNotFoundError:
+        sys.stderr.write(f"restore-verified: cannot run {args.command[0]!r}\n")
+        # The snapshots are already on disk by this point. Returning without discarding
+        # them left a copy of the tree in the temp directory for every mistyped command.
+        sentinel.discard()
+        return 2
+
+    # Read ONCE, while the command is certainly alive. With `start_new_session` it is
+    # its own group leader, so this is its pid — but asked for rather than assumed.
+    pgid = None
+    if _POSIX:
+        try:
+            pgid = os.getpgid(proc.pid)
+        except OSError:
+            pgid = None
+
+    previous = {}
+    # THE SECOND SIGNAL ESCALATES, and it has to, because forwarding alone can hang.
+    # A background job in a non-interactive shell has SIGINT set to ignore -- that is
+    # POSIX, not a quirk -- so `-- sh -c 'worker & wait'` survives a forwarded Ctrl-C
+    # and this process would wait for it forever. Waiting is right (the tree still has
+    # to be verified, which is the whole premise) but waiting FOREVER is worse than the
+    # leak it replaced. So: the first signal is passed on as sent, and a second one of
+    # any kind SIGKILLs the group, which nothing can ignore.
+    forwarded_once = False
+
+    def _forward(signum, _frame):
+        # `killed` is what turns the report on, and a forwarded signal is a kill.
+        nonlocal killed, forwarded_once
+        killed = True
+        if forwarded_once:
+            _signal_the_group(proc, pgid, signal.SIGKILL)
+            return
+        forwarded_once = True
+        _signal_the_group(proc, pgid, signum)
+
+    if _POSIX:
+        for sig in _FORWARDED:
+            try:
+                previous[sig] = signal.signal(sig, _forward)
+            except (ValueError, OSError):
+                # Not the main thread, or the platform will not have it. The command
+                # simply keeps whatever disposition it inherited.
+                pass
+    try:
+        code = proc.wait(timeout=args.timeout)
         if code < 0:
             # A CHILD KILLED BY A SIGNAL HAS A NEGATIVE `returncode`, AND A PROCESS
             # CANNOT EXIT WITH ONE. Returning -15 from here made the interpreter exit
@@ -58,24 +150,37 @@ def _cmd_run(args) -> int:
             # half returned. 128+n is the convention both halves now follow.
             code = 128 - code
     except subprocess.TimeoutExpired:
-        # `subprocess.run` has already SIGKILLed the child by the time this is caught.
-        # This is not an error path bolted on for completeness — it is the motivating
-        # case, and it is the one where the child had no chance to clean up.
+        # THE MOTIVATING CASE, and the one where the command had no chance to clean up.
+        # The group rather than the process, so the children go with it.
         killed = True
         code = EXIT_TIMEOUT
+        _signal_the_group(proc, pgid, signal.SIGKILL)
+        proc.wait()
         sys.stderr.write(
             f"[restore-verified] the command exceeded {args.timeout}s and was "
             f"SIGKILLed — no handler, no `finally`, no cleanup ran\n"
         )
-    except FileNotFoundError:
-        sys.stderr.write(f"restore-verified: cannot run {args.command[0]!r}\n")
-        # The snapshots are already on disk by this point. Returning without discarding
-        # them left a copy of the tree in the temp directory for every mistyped command.
-        sentinel.discard()
-        return 2
     except KeyboardInterrupt:
+        # Only reachable where the handler above could not be installed.
         killed = True
+        _signal_the_group(proc, pgid, signal.SIGKILL)
+        proc.wait()
         code = 130
+    finally:
+        for sig, handler in previous.items():
+            try:
+                signal.signal(sig, handler)
+            except (ValueError, OSError):
+                pass
+        if killed:
+            # THE SWEEP, and it is the half that actually fixes the reported defect.
+            # Killing the command does not kill what the command started: the first
+            # signal takes out the shell and its workers carry on holding the stdout
+            # this process inherited, so the caller waits for them however promptly this
+            # one returns. Only done when this process did the killing — a command that
+            # exits on its own may have left something running deliberately, and that
+            # is not this tool's business.
+            _signal_the_group(proc, pgid, signal.SIGKILL)
 
     drift = sentinel.verify()
     if drift and args.restore:
