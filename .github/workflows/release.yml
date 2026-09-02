@@ -208,16 +208,34 @@ jobs:
       - name: The tarball carries the JavaScript half and nothing else
         # `files` in package.json is an allowlist, and an allowlist that quietly stopped
         # matching ships a package whose entry point is not in it. Cheap to check.
+        #
+        # LISTED ONCE INTO A FILE, AND `grep` READS THE FILE. `tar ... | grep -q` under
+        # `set -o pipefail` is a race that reports the opposite of the truth: `grep -q`
+        # exits the moment it matches, `tar` is still writing, `tar` takes SIGPIPE and
+        # fails, and `pipefail` hands the pipeline tar's status rather than grep's.
+        #
+        # IT BLOCKED THE 0.1.4 RELEASE and left it half-published — PyPI had it, npm did
+        # not — with `the npm tarball is missing package/js/src/cli.js` about a tarball
+        # whose own `npm notice` listing three lines earlier said `15.8kB js/src/cli.js`.
+        # The giveaway in the log is `tar: stdout: write error`.
+        #
+        # It is a race, so it depends on whether the listing fits the pipe buffer: it
+        # never fired here until the file list grew, and it does not reproduce locally.
+        # The `package/python/` check above had the SAME bug with the opposite polarity
+        # and the worse outcome — there a SIGPIPE'd `tar` makes the condition FALSE, so
+        # the gate against shipping the Python half in the npm tarball silently would
+        # not have fired. That one has never been observed, which is the point.
         run: |
           set -euo pipefail
           npm pack --pack-destination /tmp
-          tar -tzf /tmp/restore-verified-*.tgz | sort
-          if tar -tzf /tmp/restore-verified-*.tgz | grep -q "package/python/"; then
+          tar -tzf /tmp/restore-verified-*.tgz | sort > /tmp/npm-tarball-listing
+          cat /tmp/npm-tarball-listing
+          if grep -q "^package/python/" /tmp/npm-tarball-listing; then
             echo "::error::the npm tarball carries the Python half"
             exit 1
           fi
           for required in package/js/src/index.js package/js/src/cli.js package/js/src/guard.js package/js/src/sentinel.js; do
-            if ! tar -tzf /tmp/restore-verified-*.tgz | grep -qx "$required"; then
+            if ! grep -qx "$required" /tmp/npm-tarball-listing; then
               echo "::error::the npm tarball is missing $required"
               exit 1
             fi
