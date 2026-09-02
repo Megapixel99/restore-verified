@@ -113,6 +113,24 @@ function runCommand(command, timeoutSeconds) {
 }
 
 async function cmdRun(opts, command) {
+  // A RUN THAT WATCHES NOTHING REPORTED THAT THE TREE CAME BACK. `--paths` was never
+  // checked here, so `restore-verified run -- cmd` recorded zero files, ran the
+  // command, found no drift among the nothing it had recorded, and exited 0 saying
+  // "every file matches the digest recorded before the run" — about a tree it had
+  // never looked at. That is this package's own promise inverted, and it is the
+  // zero-denominator failure `zerocase` names, shipped under this name.
+  //
+  // The Python half never had it: `required=True` on the argument gets the refusal for
+  // free, which is exactly why the halves diverged — one of them was relying on its
+  // parser for a guarantee the other had to write down.
+  //
+  // BEFORE the empty-command check, because argparse rejects a missing `--paths` while
+  // parsing and never reaches the body, so a caller who omits both gets told about
+  // `--paths` by both halves rather than about `--` by one of them.
+  if (!opts.paths.length) {
+    process.stderr.write("restore-verified run: --paths is required\n");
+    return 2;
+  }
   if (!command.length) {
     process.stderr.write("restore-verified run: nothing to run after `--`\n");
     return 2;
@@ -178,6 +196,12 @@ async function cmdRun(opts, command) {
 }
 
 function cmdRecord(opts) {
+  // The same hole as `run`, with a quieter result: a manifest of nothing, which then
+  // verifies clean forever.
+  if (!opts.paths.length) {
+    process.stderr.write("restore-verified record: --paths is required\n");
+    return 2;
+  }
   const sentinel = Sentinel.record(opts.paths, {
     keepContent: opts.keepContent,
     patterns: opts.pattern.length ? opts.pattern : null,
