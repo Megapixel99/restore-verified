@@ -30,26 +30,28 @@ release, and every one was invisible to the tests that existed at the time:
   3. ERROR-PATH EXIT CODES. Every parity test here was happy-path until the row below
      existed. `--timeout 0` was a usage error on npm and an expired deadline on PyPI.
   4. A DEADLINE THAT FIRES BUT DOES NOT BOUND THE WORK. Asserting that a timeout
-     *fires* is not asserting *when*, and BOTH HALVES OF THIS PACKAGE HAVE THIS ONE
-     TODAY. `--timeout` kills the command and returns 124 on time, but the command's
-     own children are not in the kill: they survive as orphans still holding the stdout
-     this tool inherited, so any caller that captures output — every CI harness, and
-     every test in this file — waits for the work to finish anyway. Measured: the tool
-     returns in 1.2s and the caller returns in 20.3s. `didrun` 0.1.5 had the same defect
-     and fixed it by killing the process group.
-     Not fixed here, because doing it means putting the command in its own session, and
-     that changes which signals reach it — the subject of half this package's suite. The
-     row that catches it is written and is not in this file yet for that reason.
-     Comparison cannot catch it either way: two halves that both overrun agree
-     perfectly, so it needs a flat assertion on elapsed time rather than a diff.
+     *fires* is not asserting *when*. `--timeout` killed the command and returned 124 on
+     time while the command's own children survived as orphans, still holding the stdout
+     this tool inherited — so any caller that captured output waited for the work
+     anyway: the tool returned in 1.2s and the caller in 20.3s. Both halves had it, so
+     the comparison in this file was green throughout; two halves that both overrun
+     agree perfectly, which is why the row below asserts a flat elapsed time rather than
+     a diff. Fixed by putting the command in its own session and killing the group.
+  5. AND THE COST OF FIXING 4, which is its own hazard. A command in its own session no
+     longer receives the terminal's Ctrl-C, so the signals have to be forwarded by hand
+     — and forwarding alone HANGS, because a background job in a non-interactive shell
+     has SIGINT set to ignore. Every one of those three properties needs its own row,
+     below, and none of them is a comparison.
 """
 
 import json
 import os
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -341,3 +343,91 @@ class TheHalvesRefuseTheSameShapes(unittest.TestCase):
                         fh.read(), "ORIGINAL\n",
                         f"{half} ran the command despite watching nothing",
                     )
+
+
+@unittest.skipUnless(NODE, "node is not on PATH, so the cross-half contract cannot be checked")
+class TheDeadlineBoundsTheWork(unittest.TestCase):
+    """A deadline that fires is not a deadline that bounds, and only one of those is the promise.
+
+    THE COMPARISON IN THIS FILE WAS GREEN WHILE THIS WAS BROKEN, in both halves at once,
+    which is the argument for every assertion in this class being a flat number. Two
+    halves that both overrun agree perfectly, so a parity suite made only of diffs
+    reports agreement about two runs that both ignored the deadline — this package's own
+    subject aimed at its own parity suite.
+
+    `sh -c 'X & wait'` rather than `sh -c 'X'` throughout: a shell `exec`s a single
+    simple command, so the plain form leaves no grandchild to orphan and the defect
+    hides completely on macOS. It did. CI on Linux is where it surfaced.
+    """
+
+    CEILING = 12.0  # a bound, not a stopwatch: starting an interpreter costs real time
+
+    def setUp(self):
+        self.dir = tempfile.mkdtemp(prefix="rv-deadline-")
+        self.file = os.path.join(self.dir, "m.txt")
+        with open(self.file, "w") as fh:
+            fh.write("ORIGINAL\n")
+
+    def _elapsed(self, argv, extra, sigs=()):
+        env = dict(os.environ, PYTHONPATH=ROOT)
+        started = time.monotonic()
+        proc = subprocess.Popen(
+            argv + ["run", "--paths", self.file] + extra
+            + ["--", "sh", "-c", "sleep 30 & wait"],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env, text=True,
+        )
+        # CAPTURED ON PURPOSE. The orphan holds the inherited stdout, so a pipe is what
+        # makes the defect observable at all — with the output going to the terminal the
+        # caller returns promptly and the work carries on unnoticed.
+        for sig in sigs:
+            time.sleep(1.2)
+            proc.send_signal(sig)
+        proc.communicate(timeout=120)
+        return proc.returncode, time.monotonic() - started
+
+    def _both(self, extra, sigs=()):
+        return {half: self._elapsed(argv, extra, sigs) for half, argv in halves()}
+
+    def test_a_deadline_bounds_a_caller_that_captures_output(self):
+        seen = self._both(["--timeout", "1"])
+        for half, (code, elapsed) in seen.items():
+            self.assertEqual(code, EXIT_TIMEOUT, half)
+            self.assertLess(
+                elapsed, self.CEILING,
+                f"{half} returned 124 on time but the caller waited {elapsed:.1f}s for "
+                f"the command's orphaned children",
+            )
+
+    def test_a_forwarded_signal_reaches_the_commands_children(self):
+        """The session isolation the fix needs would otherwise swallow Ctrl-C entirely."""
+        seen = self._both([], sigs=(signal.SIGTERM,))
+        for half, (code, elapsed) in seen.items():
+            # 128+n, the convention both halves report and the one a shell agrees with.
+            self.assertEqual(code, 128 + signal.SIGTERM, half)
+            self.assertLess(
+                elapsed, self.CEILING,
+                f"{half} took {elapsed:.1f}s — the signal did not reach the tree",
+            )
+
+    def test_a_signal_the_command_ignores_does_not_hang_this_one(self):
+        """A background job has SIGINT set to ignore, which is POSIX and not a quirk.
+
+        THE STATUS IS COMPARED AND NOT NAMED, deliberately. What comes back here is the
+        shell's own exit status for a `wait` that was interrupted, and shells disagree
+        about it: 129 on the macOS `sh`, and there is no reason for this file to have an
+        opinion about which is right. What this file is entitled to insist on is that
+        both halves report the SAME one and that neither hangs — the second of which is
+        a flat assertion, because two halves that both hang agree perfectly.
+        """
+        seen = self._both([], sigs=(signal.SIGINT,))
+        self.assertEqual(
+            seen["python"][0], seen["javascript"][0],
+            f"the halves disagree about a command interrupted mid-wait: {seen}",
+        )
+        for half, (code, elapsed) in seen.items():
+            self.assertNotEqual(code, 0, f"{half} reported success for an interrupted run")
+            self.assertLess(
+                elapsed, self.CEILING,
+                f"{half} forwarded a signal the command ignores and then waited "
+                f"{elapsed:.1f}s for it",
+            )
