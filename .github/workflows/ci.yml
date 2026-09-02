@@ -128,15 +128,21 @@ jobs:
         # signals would make them vanish rather than fail, and the package would ship
         # with its whole premise untested and a green tick.
         #
-        # `-k SIG` SELECTS THEM AND `unittest` COUNTS THEM. The old form re-ran the
-        # whole suite and grepped the transcript for the string, which counts a test by
-        # its NAME: rename one and the floor drops silently, and a test that was
-        # collected and never executed still printed its name. This asks the runner how
-        # many it ran, and `didrun` refuses the zero that `-k` produces when it matches
-        # nothing.
+        # `-k Signals` SELECTS THE CLASS AND `unittest` COUNTS WHAT IT RAN. The old
+        # form re-ran the whole suite and grepped the transcript for SIGTERM/SIGKILL/
+        # SIGINT, which counts a test by its NAME on a line the runner printed whether
+        # or not the test executed — a `... skipped 'reason'` line carries the name too,
+        # so a suite that skipped every one of them still cleared the floor.
+        #
+        # AND THE PATTERN NAMED A SPELLING RATHER THAN THE GROUP. Four of the five tests
+        # in `Signals` have a signal in their name; `test_the_signal_is_re_delivered_so_
+        # a_kill_still_kills` does not, so the floor of 4 was blind to the one asserting
+        # that a guard which swallows SIGTERM and returns normally is wrong. Deleting it
+        # left the gate green. The class is the group, so the class is what is selected,
+        # and the floor is its whole membership.
         run: |
-          didrun --expect-count "Ran ([0-9]+) tests" --min 4 \
-            -- python3 -m unittest discover -s python/tests -k SIG -v
+          didrun --expect-count "Ran ([0-9]+) tests" --min 5 \
+            -- python3 -m unittest discover -s python/tests -k Signals -v
 
       - name: the tree came back
         # The suite breaks files on purpose. This is `Sentinel.verify()` asked of the
@@ -158,6 +164,21 @@ jobs:
       matrix:
         # `package.json` says `>=18`, and `node:test` is what the suites use.
         node-version: ['18', '22', '24']
+        # WHETHER A ROW CAN HOST THE GATES IS A FACT ABOUT THE ROW, so it is written on
+        # the row. `zerocase` and `didrun` declare `node >= 20`; 18 is here because
+        # `package.json` promises it. The steps below used to ask `!= '18'`, which is a
+        # string comparison wearing a version predicate's clothes: write the same row as
+        # `'18.x'` — the ordinary `setup-node` spelling — and it stops being equal to
+        # `'18'`, the gates install below their own engine floor, and npm says EBADENGINE
+        # in a warning nobody reads. A row added without `gated` is falsy and therefore
+        # ungated, which is the safe direction to fail in.
+        include:
+          - node-version: '18'
+            gated: false
+          - node-version: '22'
+            gated: true
+          - node-version: '24'
+            gated: true
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-node@v7
@@ -177,22 +198,19 @@ jobs:
                    }
                    console.log('restore-verified', p.version)"
 
-      # BOTH GATES DECLARE `node >= 20` AND THIS MATRIX STILL COVERS 18, because
-      # `package.json` promises 18 and the matrix is that promise being kept. So the 18
-      # row runs the suite unwrapped and the rows that can host the tools run it gated.
       # Installing a tool onto a runtime its author excluded, and then reading its
       # verdict, is the shape of mistake the pinned action majors above are a note
-      # about.
+      # about. `matrix.gated` is where that decision is recorded; see the matrix.
       - name: the gates, installed globally so the tree stays clean
-        if: matrix.node-version != '18'
+        if: matrix.gated
         run: npm install -g zerocase@0.1.6 @megapixel99/didrun@0.1.5
 
       - name: the suites
-        if: matrix.node-version == '18'
+        if: ${{ !matrix.gated }}
         run: node --test js/test/*.test.js
 
       - name: the suites, with a floor under what actually ran
-        if: matrix.node-version != '18'
+        if: matrix.gated
         # TWO REPORTERS: `spec` to the log for a person, `tap` to a file for the gate.
         # The TAP plan is the denominator, and it is the number `zerocase` puts a floor
         # under — `1..N` minus the lines marked `# SKIP`, so a suite in which every test
@@ -363,10 +381,16 @@ jobs:
           # `--help` EXITING 0 IS NOT `--help` PRINTING ANYTHING. An entry point that
           # imports cleanly, prints nothing and returns is a working command by exit
           # code and a broken one by every other measure — and that is the whole of what
-          # a bare `--help` step was checking. Both halves are asked to NAME ALL THREE
-          # SUBCOMMANDS instead, which is the smallest statement of the contract the two
-          # of them share, and it fails on the half that grew a fourth without the
-          # other.
+          # a bare `--help` step was checking. Both halves are asked to name all three
+          # subcommands instead, so a help text that lost one, or printed nothing at
+          # all, fails here.
+          #
+          # THIS IS PRESENCE AND NOT PARITY, and the difference matters. Three positive
+          # matches cannot notice a FOURTH subcommand that one half grew and the other
+          # did not: both halves would still print `run`, `record` and `verify`, both
+          # would exit 0, and this job would be green while the two registries shipped
+          # different CLIs. Nothing in this tree compares the two surfaces; `parity`
+          # compares the manifest bytes and a hand-written list of constants.
           cd /tmp   # away from the source tree, so nothing can resolve from it
           didrun --expect "run" --expect "record" --expect "verify" \
             -- /tmp/venv/bin/restore-verified --help
