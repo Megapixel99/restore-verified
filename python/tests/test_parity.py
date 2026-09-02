@@ -37,7 +37,11 @@ release, and every one was invisible to the tests that existed at the time:
      the comparison in this file was green throughout; two halves that both overrun
      agree perfectly, which is why the row below asserts a flat elapsed time rather than
      a diff. Fixed by putting the command in its own session and killing the group.
-  5. AND THE COST OF FIXING 4, which is its own hazard. A command in its own session no
+  5. TWO HELP TEXTS THAT SHARE NO GRAMMAR, so nothing could compare them. One half
+     generated `usage: restore-verified [-h] {run,record,verify} ...` from argparse and
+     the other hand-wrote prose; a CI file is written from whichever one its author read.
+     Closed by hand-writing this half's too, so the bytes can be compared.
+  6. AND THE COST OF FIXING 4, which is its own hazard. A command in its own session no
      longer receives the terminal's Ctrl-C, so the signals have to be forwarded by hand
      — and forwarding alone HANGS, because a background job in a non-interactive shell
      has SIGINT set to ignore. Every one of those three properties needs its own row,
@@ -431,3 +435,59 @@ class TheDeadlineBoundsTheWork(unittest.TestCase):
                 f"{half} forwarded a signal the command ignores and then waited "
                 f"{elapsed:.1f}s for it",
             )
+
+
+@unittest.skipUnless(NODE, "node is not on PATH, so the cross-half contract cannot be checked")
+class TheCommandLineSaysTheSameThing(unittest.TestCase):
+    """Two copies of the usage text, and a CI file is written from whichever one was read.
+
+    THE OUTPUT IS COMPARED AND NOT THE CONSTANTS. Two strings that differ only in how
+    they are escaped render identically, and two that look identical in source can
+    render differently — a source comparison gets both wrong, and it is how a sibling
+    package nearly missed exactly this. So both real command lines are run.
+
+    This is the row that `didrun` and `zerocase` already carry, and it could not be
+    written here until this half stopped generating its help from argparse: the two
+    texts shared no grammar, so there was nothing to compare and no test could say so.
+    """
+
+    def _help(self, argv):
+        return subprocess.run(argv + ["--help"], capture_output=True, text=True,
+                              env=dict(os.environ, PYTHONPATH=ROOT), timeout=120)
+
+    def test_the_usage_text_is_identical(self):
+        seen = {half: self._help(argv) for half, argv in halves()}
+        for half, out in seen.items():
+            self.assertEqual(out.returncode, 0, f"{half} --help did not exit 0")
+            # THE CANARY. Byte-equality between two empty strings is byte-equality, and
+            # an entry point that prints nothing is the defect this file exists to
+            # catch rather than a pass.
+            self.assertIn("--paths", out.stderr,
+                          f"{half} printed something, but it is not the flag list")
+            self.assertEqual(out.stdout, "", f"{half} wrote its usage to stdout")
+        self.assertEqual(
+            seen["python"].stderr, seen["javascript"].stderr,
+            "the two halves describe different tools under one name",
+        )
+
+    def test_every_subcommand_the_usage_names_is_one_both_halves_accept(self):
+        """The list in the text is the list the parsers answer to, in both halves.
+
+        Presence in the help proves only that somebody typed it. This asks each half
+        about each subcommand the shared text advertises, and a name one half does not
+        know is a name the other should not be advertising.
+        """
+        text = self._help(halves()[0][1]).stderr
+        named = [c for c in ("run", "record", "verify") if f"restore-verified {c}" in text]
+        self.assertEqual(len(named), 3, f"the usage stopped naming all three: {named}")
+        for half, argv in halves():
+            for cmd in named:
+                with self.subTest(half=half, subcommand=cmd):
+                    # No arguments, so this is refused — but refused as a MISSING FLAG
+                    # (2), never as an unknown subcommand, which is what a half that had
+                    # dropped it would report.
+                    out = subprocess.run(argv + [cmd], capture_output=True, text=True,
+                                         env=dict(os.environ, PYTHONPATH=ROOT), timeout=120)
+                    self.assertEqual(out.returncode, 2, f"{half} {cmd}: {out.stderr[:200]}")
+                    self.assertNotIn("unknown", (out.stderr or "").lower(),
+                                     f"{half} does not know the subcommand {cmd!r}")
