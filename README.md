@@ -245,6 +245,17 @@ real CLIs rather than trusting either to be right about itself: a deadline that 
 seconds to one half and milliseconds to the other would make a CI file depend on which
 binary won the PATH.
 
+The deadline kills the command's **process group**, not just the command. Until 0.1.4 it
+killed only the process named after `--`, so `-- ./harness.sh` returned 124 on time while
+the workers that harness had started carried on — still holding the stdout this tool
+inherited, so anything capturing the output waited for them anyway. The command therefore
+runs in its own session, and SIGINT, SIGTERM and SIGHUP are forwarded to it so a Ctrl-C
+still arrives; a second one escalates to SIGKILL, because a background job in a shell has
+SIGINT set to ignore and forwarding alone would wait forever.
+
+`--paths` is required by both halves. Until 0.1.4 the npm half accepted its absence,
+recorded nothing, ran the command and reported that the tree came back.
+
 Exit code **3** means the tree did not come back; its own code, never folded into the
 command's status, because a harness that exits 0 having left a file mutated is the exact
 failure this exists to report. **124** is the deadline expiring, as `timeout(1)` reports
@@ -270,7 +281,7 @@ recoverable, not trustworthy.
 ## Tests
 
 ```sh
-python3 -m unittest discover -s python/tests   # 41, including the cross-half contract
+python3 -m unittest discover -s python/tests   # 48, including the cross-half contract
 npm test                                       # 33
 ```
 
